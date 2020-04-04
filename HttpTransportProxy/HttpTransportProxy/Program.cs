@@ -242,13 +242,13 @@ namespace HttpTransportProxy {
 						buffer2[1] = (byte)'\n';
 						await remoteStream.WriteAsync(buffer2, 0, 2);
 
-						// write remaing data
+						// write remaining data
 						if (bytesBuffered - bytesConsumed > 0) {
 							requestLength += (bytesBuffered - bytesConsumed);
 							await remoteStream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
 						}
 
-						// read remaing data
+						// read remaining data
 						while (stream.DataAvailable) {
 							var bytesRead = await stream.ReadAsync(buffer);
 							if (bytesRead == 0) {
@@ -372,13 +372,13 @@ namespace HttpTransportProxy {
 						buffer2[1] = (byte)'\n';
 						await stream.WriteAsync(buffer2, 0, 2);
 
-						// write remaing data
+						// write remaining data
 						if (bytesBuffered - bytesConsumed > 0) {
 							responseLength += (bytesBuffered - bytesConsumed);
 							await stream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
 						}
 
-						// read remaing data
+						// read remaining data
 						while (remoteStream.DataAvailable) {
 							var bytesRead = await remoteStream.ReadAsync(buffer);
 							if (bytesRead == 0) {
