@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 16
 VisualStudioVersion = 16.0.29926.136
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HttpTransportProxy", "HttpTransportProxy\HttpTransportProxy.csproj", "{1F87C556-AB45-4872-87D4-9A52593509F8}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HttpTransportProxy", "HttpTransportProxy\HttpTransportProxy.csproj", "{D55B4B02-8A48-492F-9938-FDC21F05011B}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -11,15 +11,15 @@ Global
 		Release|Any CPU = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{1F87C556-AB45-4872-87D4-9A52593509F8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{1F87C556-AB45-4872-87D4-9A52593509F8}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{1F87C556-AB45-4872-87D4-9A52593509F8}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{1F87C556-AB45-4872-87D4-9A52593509F8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D55B4B02-8A48-492F-9938-FDC21F05011B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D55B4B02-8A48-492F-9938-FDC21F05011B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D55B4B02-8A48-492F-9938-FDC21F05011B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D55B4B02-8A48-492F-9938-FDC21F05011B}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
-		SolutionGuid = {587A0D8E-510C-44D3-99F5-B91CFCBF19D0}
+		SolutionGuid = {C02DC66C-BED8-4311-9A64-79548C25C75F}
 	EndGlobalSection
 EndGlobal
