@@ -93,24 +93,29 @@ namespace HttpTransportProxy {
 			using (var stream = new NetworkStream(socket, FileAccess.ReadWrite, false)) {
 
 				while (!isEnd /*&& stream.DataAvailable*/) {
-					var bytesRemaining = buffer.Length - bytesBuffered;
-
-					if (bytesRemaining == 0) {
-						var newBuffer = ArrayPool<byte>.Shared.Rent(buffer.Length * 2);
-						Buffer.BlockCopy(buffer, 0, newBuffer, 0, buffer.Length);
+					var bytesInBuffer = bytesBuffered - bytesConsumed;
+					if (bytesInBuffer > (buffer.Length / 2)) {
+						// expand buffer
+						var newBuffer = ArrayPool<byte>.Shared.Rent((buffer.Length < (int.MaxValue / 2)) ? buffer.Length * 2 : int.MaxValue);
+						// copy the unprocessed data
+						Buffer.BlockCopy(buffer, bytesConsumed, newBuffer, 0, bytesInBuffer);
 						ArrayPool<byte>.Shared.Return(buffer);
 						buffer = newBuffer;
-						bytesRemaining = buffer.Length - bytesBuffered;
 					}
+					else if (bytesInBuffer > 0) {
+						Buffer.BlockCopy(buffer, bytesConsumed, buffer, 0, bytesInBuffer);
+					}
+					bytesIndex -= bytesConsumed;
+					bytesConsumed = 0;
 
-					var bytesRead = await stream.ReadAsync(buffer, bytesBuffered, bytesRemaining);
+					var bytesRead = await stream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
 					if (bytesRead == 0) {
 						Console.WriteLine("Client closed the connection");
 						unexpectedClose = true;
 						break;
 					}
 
-					bytesBuffered += bytesRead;
+					bytesBuffered = bytesInBuffer + bytesRead;
 
 					// look for CRLF | RFC 2616
 					int linePosition;
@@ -280,24 +285,29 @@ namespace HttpTransportProxy {
 						bytesBuffered = bytesConsumed = bytesIndex = 0;
 						unexpectedClose = isEnd = false;
 						while (!isEnd /*&& remoteStream.DataAvailable*/) {
-							var bytesRemaining = buffer.Length - bytesBuffered;
-
-							if (bytesRemaining == 0) {
-								var newBuffer = ArrayPool<byte>.Shared.Rent(buffer.Length * 2);
-								Buffer.BlockCopy(buffer, 0, newBuffer, 0, buffer.Length);
+							var bytesInBuffer = bytesBuffered - bytesConsumed;
+							if (bytesInBuffer > (buffer.Length / 2)) {
+								// expand buffer
+								var newBuffer = ArrayPool<byte>.Shared.Rent((buffer.Length < (int.MaxValue / 2)) ? buffer.Length * 2 : int.MaxValue);
+								// copy the unprocessed data
+								Buffer.BlockCopy(buffer, bytesConsumed, newBuffer, 0, bytesInBuffer);
 								ArrayPool<byte>.Shared.Return(buffer);
 								buffer = newBuffer;
-								bytesRemaining = buffer.Length - bytesBuffered;
 							}
+							else if (bytesInBuffer > 0) {
+								Buffer.BlockCopy(buffer, bytesConsumed, buffer, 0, bytesInBuffer);
+							}
+							bytesIndex -= bytesConsumed;
+							bytesConsumed = 0;
 
-							var bytesRead = await remoteStream.ReadAsync(buffer, bytesBuffered, bytesRemaining);
+							var bytesRead = await remoteStream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
 							if (bytesRead == 0) {
 								Console.WriteLine("Server closed the connection");
 								unexpectedClose = true;
 								break;
 							}
 
-							bytesBuffered += bytesRead;
+							bytesBuffered = bytesInBuffer + bytesRead;
 
 							// look for CRLF | RFC 2616
 							int linePosition;
@@ -392,7 +402,7 @@ namespace HttpTransportProxy {
 						ArrayPool<byte>.Shared.Return(buffer2);
 
 						if (contentLength != responseLength) {
-							Console.WriteLine("Unexpected response length");
+							Console.WriteLine($"Unexpected response length {responseLength} expected {contentLength}");
 						}
 					}
 				}
