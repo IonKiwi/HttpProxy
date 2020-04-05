@@ -370,7 +370,7 @@ namespace HttpTransportProxy {
 										break;
 									}
 									bytesBuffered = bytesInBuffer + bytesRead;
-									await remoteStream.WriteAsync(buffer, 0, bytesRead);
+									await remoteStream.WriteAsync(buffer, bytesInBuffer, bytesRead);
 								}
 							}
 							while (true);
@@ -657,7 +657,7 @@ namespace HttpTransportProxy {
 										break;
 									}
 									bytesBuffered = bytesInBuffer + bytesRead;
-									await stream.WriteAsync(buffer, 0, bytesRead);
+									await stream.WriteAsync(buffer, bytesInBuffer, bytesRead);
 								}
 							}
 							while (true);
