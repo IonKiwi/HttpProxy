@@ -25,6 +25,8 @@ namespace HttpTransportProxy {
 
 		private static bool _isWindows;
 		private static IFarmSettings _settings;
+		private static volatile bool _exit;
+		private static readonly List<(Socket socket, X509Certificate2 certificate)> _sockets = new List<(Socket socket, X509Certificate2 certificate)>();
 
 		static async Task Main(string[] args) {
 			IConfiguration config = GetConfiguration();
@@ -42,12 +44,17 @@ namespace HttpTransportProxy {
 			}
 			while (true);
 
+			_exit = true;
+			foreach (var socket in _sockets) {
+				socket.socket.Close();
+				socket.socket.Dispose();
+			}
+
 			LogInformation("Completed");
 		}
 
 		private static async Task Accept() {
 			var ipAddress = IPAddress.Any;
-			var sockets = new List<(Socket socket, X509Certificate2 certificate)>();
 			var tasks = new List<Task<Socket>>();
 
 			var serverBindings = _settings.ServerBindings;
@@ -60,7 +67,7 @@ namespace HttpTransportProxy {
 						listenSocket.Bind(new IPEndPoint(ipAddress, kv.Port));
 						LogInformation($"Listening on port {kv.Port}");
 						listenSocket.Listen(120);
-						sockets.Add((listenSocket, null));
+						_sockets.Add((listenSocket, null));
 						tasks.Add(listenSocket.AcceptAsync());
 					}
 					else {
@@ -69,18 +76,18 @@ namespace HttpTransportProxy {
 						listenSocket.Bind(new IPEndPoint(ipAddress, kv.Port));
 						LogInformation($"Listening on port {kv.Port}");
 						listenSocket.Listen(120);
-						sockets.Add((listenSocket, certificate));
+						_sockets.Add((listenSocket, certificate));
 						tasks.Add(listenSocket.AcceptAsync());
 					}
 				}
 			}
 
-			while (true) {
+			while (!_exit) {
 				await Task.WhenAny(tasks);
 				for (var i = tasks.Count - 1; i >= 0; i--) {
 					var t = tasks[i];
-					if (t.IsCompletedSuccessfully) {
-						var socket = sockets[i];
+					if (t.IsCompletedSuccessfully && !_exit) {
+						var socket = _sockets[i];
 						tasks[i] = socket.socket.AcceptAsync();
 						Func<Task> acceptAction = () => HandleConnection(t.Result, socket.certificate);
 						_ = Task.Run(acceptAction);
