@@ -134,6 +134,7 @@ namespace HttpTransportProxy {
 								}
 								else {
 									bytesConsumed = linePosition + 1;
+									bytesIndex = bytesConsumed;
 									isEnd = true;
 									break;
 								}
@@ -326,6 +327,7 @@ namespace HttpTransportProxy {
 										}
 										else {
 											bytesConsumed = linePosition + 1;
+											bytesIndex = bytesConsumed;
 											isEnd = true;
 											break;
 										}
@@ -382,27 +384,159 @@ namespace HttpTransportProxy {
 						buffer2[1] = (byte)'\n';
 						await stream.WriteAsync(buffer2, 0, 2);
 
-						// write remaining data
-						if (bytesBuffered - bytesConsumed > 0) {
-							responseLength += (bytesBuffered - bytesConsumed);
-							await stream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
-						}
-
-						// read remaining data
-						while (remoteStream.DataAvailable) {
-							var bytesRead = await remoteStream.ReadAsync(buffer);
-							if (bytesRead == 0) {
-								break;
-							}
-
-							responseLength += bytesRead;
-							await stream.WriteAsync(buffer, 0, bytesRead);
-						}
-
 						ArrayPool<byte>.Shared.Return(buffer2);
 
-						if (contentLength != responseLength) {
-							Console.WriteLine($"Unexpected response length {responseLength} expected {contentLength}");
+						if (isChunked) {
+							// write remaining data
+							if (bytesBuffered - bytesConsumed > 0) {
+								responseLength += (bytesBuffered - bytesConsumed);
+								await stream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
+							}
+
+							int chunkCount = 0;
+							long chunkSize = 0, chunkLength = 0;
+							bool isStart = true, getMoreData = true;
+							isEnd = false;
+							bytesIndex = bytesConsumed;
+							do {
+								if (isStart) {
+									getMoreData = true;
+									// look for CRLF
+									int linePosition;
+									do {
+										linePosition = Array.IndexOf(buffer, (byte)'\n', bytesIndex, bytesBuffered - bytesIndex);
+										if (linePosition >= 0) {
+											if (linePosition == 0 || buffer[linePosition - 1] != (byte)'\r') {
+												bytesIndex = linePosition + 1;
+											}
+											else {
+												var line = Encoding.UTF8.GetString(buffer, bytesConsumed, linePosition - bytesConsumed - 1);
+												bytesConsumed = linePosition + 1;
+												bytesIndex = bytesConsumed;
+												isStart = false;
+												if (line.Length == 0 || !long.TryParse(line, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out chunkSize) || chunkSize < 0) {
+													Console.WriteLine($"Unexpected chunk size {line}");
+													ArrayPool<byte>.Shared.Return(buffer);
+													socket.Close();
+													return;
+												}
+												getMoreData = false;
+												break;
+											}
+										}
+									}
+									while (linePosition >= 0);
+								}
+								else if (isEnd) {
+									getMoreData = true;
+									var bytesInBuffer = bytesBuffered - bytesConsumed;
+									if (bytesInBuffer > 1) {
+										if (buffer[bytesConsumed] != (byte)'\r' || buffer[bytesConsumed + 1] != (byte)'\n') {
+											Console.WriteLine($"Unexpected chunk end {buffer[bytesConsumed]:x2} {buffer[bytesConsumed + 1]:x2}");
+											ArrayPool<byte>.Shared.Return(buffer);
+											socket.Close();
+											return;
+										}
+										chunkCount++;
+										if (chunkSize == 0) {
+											bytesConsumed += 2;
+											bytesIndex = bytesConsumed;
+											getMoreData = false;
+											break;
+										}
+										isEnd = false;
+										isStart = true;
+										bytesConsumed += 2;
+										bytesIndex = bytesConsumed;
+										responseLength += chunkSize;
+										chunkLength = 0;
+										chunkSize = 0;
+										getMoreData = false;
+									}
+								}
+								else {
+									var remaining = chunkSize - chunkLength;
+									var nextBlock = bytesBuffered - bytesConsumed;
+									if (nextBlock > remaining) {
+										nextBlock = (int)remaining;
+									}
+									bytesConsumed += nextBlock;
+									bytesIndex = bytesConsumed;
+									chunkLength += nextBlock;
+									isEnd = chunkLength == chunkSize;
+									getMoreData = !isEnd;
+								}
+
+								if (getMoreData) {
+									if (!remoteStream.DataAvailable) { break; }
+									var bytesInBuffer = bytesBuffered - bytesConsumed;
+									if (bytesInBuffer > (buffer.Length / 2)) {
+										// expand buffer
+										var newBuffer = ArrayPool<byte>.Shared.Rent((buffer.Length < (int.MaxValue / 2)) ? buffer.Length * 2 : int.MaxValue);
+										// copy the unprocessed data
+										Buffer.BlockCopy(buffer, bytesConsumed, newBuffer, 0, bytesInBuffer);
+										ArrayPool<byte>.Shared.Return(buffer);
+										buffer = newBuffer;
+									}
+									else if (bytesInBuffer > 0) {
+										Buffer.BlockCopy(buffer, bytesConsumed, buffer, 0, bytesInBuffer);
+									}
+									bytesIndex -= bytesConsumed;
+									bytesConsumed = 0;
+
+									var bytesRead = await remoteStream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
+									if (bytesRead == 0) {
+										Console.WriteLine("Server closed the connection");
+										unexpectedClose = true;
+										break;
+									}
+									bytesBuffered = bytesInBuffer + bytesRead;
+									await stream.WriteAsync(buffer, 0, bytesRead);
+								}
+							}
+							while (true);
+
+							if (unexpectedClose) {
+								ArrayPool<byte>.Shared.Return(buffer);
+								socket.Close();
+								return;
+							}
+
+							if (!isEnd || getMoreData) {
+								ArrayPool<byte>.Shared.Return(buffer);
+								Console.WriteLine("Unexpected response from server");
+								socket.Close();
+								return;
+							}
+
+							if (bytesBuffered - bytesConsumed > 0) {
+								ArrayPool<byte>.Shared.Return(buffer);
+								Console.WriteLine("Unexpected response from server");
+								socket.Close();
+								return;
+							}
+						}
+						else {
+							// write remaining data
+							if (bytesBuffered - bytesConsumed > 0) {
+								responseLength += (bytesBuffered - bytesConsumed);
+								await stream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
+							}
+
+							// read remaining data
+							while (remoteStream.DataAvailable) {
+								var bytesRead = await remoteStream.ReadAsync(buffer);
+								if (bytesRead == 0) {
+									break;
+								}
+
+								responseLength += bytesRead;
+								await stream.WriteAsync(buffer, 0, bytesRead);
+							}
+
+							if (contentLength != responseLength) {
+								Console.WriteLine($"Unexpected response length {responseLength} expected {contentLength}");
+							}
 						}
 					}
 				}
