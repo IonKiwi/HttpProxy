@@ -9,8 +9,10 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -29,9 +31,17 @@ namespace HttpTransportProxy {
 			_settings = GetFarSettings(config);
 
 			Func<Task> acceptAction = Accept;
-			await Task.Run(acceptAction);
+			_ = Task.Run(acceptAction);
 
-			Console.WriteLine("Completed");
+			do {
+				string line = Console.ReadLine();
+				if (string.Equals("exit", line, StringComparison.Ordinal)) {
+					break;
+				}
+			}
+			while (true);
+
+			LogInformation("Completed");
 		}
 
 		private static async Task Accept() {
@@ -47,7 +57,7 @@ namespace HttpTransportProxy {
 						// non-secure binding
 						var listenSocket = new Socket(SocketType.Stream, ProtocolType.Tcp);
 						listenSocket.Bind(new IPEndPoint(ipAddress, kv.Port));
-						Console.WriteLine($"Listening on port {kv.Port}");
+						LogInformation($"Listening on port {kv.Port}");
 						listenSocket.Listen(120);
 						sockets.Add((listenSocket, null));
 						tasks.Add(listenSocket.AcceptAsync());
@@ -56,7 +66,7 @@ namespace HttpTransportProxy {
 						// secure binding
 						var listenSocket = new Socket(SocketType.Stream, ProtocolType.Tcp);
 						listenSocket.Bind(new IPEndPoint(ipAddress, kv.Port));
-						Console.WriteLine($"Listening on port {kv.Port}");
+						LogInformation($"Listening on port {kv.Port}");
 						listenSocket.Listen(120);
 						sockets.Add((listenSocket, certificate));
 						tasks.Add(listenSocket.AcceptAsync());
@@ -87,19 +97,48 @@ namespace HttpTransportProxy {
 				await HandleConnectionInternal(socket, certificate);
 			}
 			catch (Exception ex) {
-				Console.WriteLine("Exception: " + ex.Message);
+				LogWarning("Exception: " + ex.Message);
 			}
 		}
 
 		private static async Task HandleConnectionInternal(Socket socket, X509Certificate2 certificate) {
-			Console.WriteLine($"Accepted connection from {socket.RemoteEndPoint}");
+			LogInformation($"Accepted connection from {socket.RemoteEndPoint}");
 
 			byte[] buffer = ArrayPool<byte>.Shared.Rent(1024);
 			int bytesBuffered = 0, bytesConsumed = 0, bytesIndex = 0;
 			bool unexpectedClose = false, isEnd = false;
 			List<string> headers = new List<string>(10);
 			long requestLength = 0;
-			using (var stream = new NetworkStream(socket, FileAccess.ReadWrite, false)) {
+			using (var clientStream = new NetworkStream(socket, FileAccess.ReadWrite, false)) {
+				Stream sourceStream = clientStream;
+				SslStream sourceSslStream = null;
+				if (certificate != null) {
+					sourceStream = sourceSslStream = new SslStream(clientStream, true);
+					var protocols = SslProtocols.Tls12;
+					if (!_isWindows) {
+						protocols |= SslProtocols.Tls13;
+					}
+					//CipherSuitesPolicy policy = new CipherSuitesPolicy(new[] {
+					//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+					//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+					//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+					//	TlsCipherSuite.TLS_AES_128_GCM_SHA256,
+					//	TlsCipherSuite.TLS_AES_256_GCM_SHA384,
+					//	TlsCipherSuite.TLS_CHACHA20_POLY1305_SHA256,
+					//});
+					await sourceSslStream.AuthenticateAsServerAsync(new SslServerAuthenticationOptions() {
+						ApplicationProtocols = new List<SslApplicationProtocol>() {
+							SslApplicationProtocol.Http11,
+							//SslApplicationProtocol.Http2
+						},
+						ClientCertificateRequired = false,
+						EnabledSslProtocols = protocols,
+						ServerCertificate = certificate,
+						AllowRenegotiation = false,
+						CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+						EncryptionPolicy = EncryptionPolicy.RequireEncryption,
+					});
+				}
 
 				while (!isEnd /*&& stream.DataAvailable*/) {
 					var bytesInBuffer = bytesBuffered - bytesConsumed;
@@ -117,9 +156,9 @@ namespace HttpTransportProxy {
 					bytesIndex -= bytesConsumed;
 					bytesConsumed = 0;
 
-					var bytesRead = await stream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
+					var bytesRead = await sourceStream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
 					if (bytesRead == 0) {
-						Console.WriteLine("Client closed the connection");
+						LogWarning("Client closed the connection");
 						unexpectedClose = true;
 						break;
 					}
@@ -162,7 +201,7 @@ namespace HttpTransportProxy {
 
 				if (headers.Count == 0 || !isEnd) {
 					ArrayPool<byte>.Shared.Return(buffer);
-					Console.WriteLine("Unexpected request from client");
+					LogWarning("Unexpected request from client");
 					socket.Close();
 					return;
 				}
@@ -170,7 +209,7 @@ namespace HttpTransportProxy {
 				int i = headers[0].IndexOf(' ');
 				if (i < 0) {
 					ArrayPool<byte>.Shared.Return(buffer);
-					Console.WriteLine("Unexpected request from client");
+					LogWarning("Unexpected request from client");
 					socket.Close();
 					return;
 				}
@@ -179,7 +218,7 @@ namespace HttpTransportProxy {
 				int i2 = headers[0].IndexOf(' ', i + 1);
 				if (i2 < 0) {
 					ArrayPool<byte>.Shared.Return(buffer);
-					Console.WriteLine("Unexpected request from client");
+					LogWarning("Unexpected request from client");
 					socket.Close();
 					return;
 				}
@@ -197,7 +236,7 @@ namespace HttpTransportProxy {
 
 				if (proxy == null) {
 					ArrayPool<byte>.Shared.Return(buffer);
-					Console.WriteLine($"No proxy configuration for request to {destination}");
+					LogWarning($"No proxy configuration for request to {destination}");
 					socket.Close();
 					return;
 				}
@@ -217,7 +256,7 @@ namespace HttpTransportProxy {
 					else if (line.StartsWith("Content-Length: ", StringComparison.Ordinal)) {
 						if (!long.TryParse(line.Substring("Content-Length: ".Length), NumberStyles.None, CultureInfo.InvariantCulture, out contentLength)) {
 							ArrayPool<byte>.Shared.Return(buffer);
-							Console.WriteLine($"Failed to parse content length '{line}'");
+							LogWarning($"Failed to parse content length '{line}'");
 							socket.Close();
 							return;
 						}
@@ -234,7 +273,7 @@ namespace HttpTransportProxy {
 				IPAddress[] serverIps = Dns.GetHostAddresses(targetUri.DnsSafeHost);
 				if (serverIps == null || serverIps.Length == 0) {
 					ArrayPool<byte>.Shared.Return(buffer);
-					Console.WriteLine($"Failed to resolve addresses of {proxy.Target}");
+					LogWarning($"Failed to resolve addresses of {proxy.Target}");
 					socket.Close();
 					return;
 				}
@@ -243,6 +282,36 @@ namespace HttpTransportProxy {
 					await remoteSocket.ConnectAsync(serverIps, connectPort);
 
 					using (var remoteStream = new NetworkStream(remoteSocket, FileAccess.ReadWrite, false)) {
+						Stream targetStream = remoteStream;
+						SslStream targetSslStream = null;
+						if (targetUri.Scheme == Uri.UriSchemeHttps) {
+							targetStream = targetSslStream = new SslStream(remoteStream, true);
+							var protocols = SslProtocols.Tls12;
+							if (!_isWindows) {
+								protocols |= SslProtocols.Tls13;
+							}
+							//CipherSuitesPolicy policy = new CipherSuitesPolicy(new[] {
+							//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+							//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+							//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+							//	TlsCipherSuite.TLS_AES_128_GCM_SHA256,
+							//	TlsCipherSuite.TLS_AES_256_GCM_SHA384,
+							//	TlsCipherSuite.TLS_CHACHA20_POLY1305_SHA256,
+							//});
+							await targetSslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions() {
+								AllowRenegotiation = false,
+								ApplicationProtocols = new List<SslApplicationProtocol>() {
+									SslApplicationProtocol.Http11,
+									//SslApplicationProtocol.Http2
+								},
+								CertificateRevocationCheckMode = X509RevocationMode.Online,
+								//CipherSuitesPolicy = policy,
+								EnabledSslProtocols = protocols,
+								EncryptionPolicy = EncryptionPolicy.RequireEncryption,
+								TargetHost = targetUri.Host,
+								RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => ValidateServerCertificate(certificate, chain, sslPolicyErrors, proxy)
+							});
+						}
 
 						List<string> responseHeaders = new List<string>(10);
 						long responseLength = 0;
@@ -258,17 +327,17 @@ namespace HttpTransportProxy {
 							int l = Encoding.UTF8.GetBytes(header, buffer2);
 							buffer2[l] = (byte)'\r';
 							buffer2[l + 1] = (byte)'\n';
-							await remoteStream.WriteAsync(buffer2, 0, l + 2);
+							await targetStream.WriteAsync(buffer2, 0, l + 2);
 						}
 						buffer2[0] = (byte)'\r';
 						buffer2[1] = (byte)'\n';
-						await remoteStream.WriteAsync(buffer2, 0, 2);
+						await targetStream.WriteAsync(buffer2, 0, 2);
 
 						if (isChunked) {
 							// write remaining data
 							if (bytesBuffered - bytesConsumed > 0) {
 								responseLength += (bytesBuffered - bytesConsumed);
-								await remoteStream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
+								await targetStream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
 							}
 
 							int chunkCount = 0;
@@ -293,7 +362,7 @@ namespace HttpTransportProxy {
 												bytesIndex = bytesConsumed;
 												isStart = false;
 												if (line.Length == 0 || !long.TryParse(line, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out chunkSize) || chunkSize < 0) {
-													Console.WriteLine($"Unexpected chunk size {line}");
+													LogWarning($"Unexpected chunk size {line}");
 													ArrayPool<byte>.Shared.Return(buffer2);
 													ArrayPool<byte>.Shared.Return(buffer);
 													socket.Close();
@@ -311,7 +380,7 @@ namespace HttpTransportProxy {
 									var bytesInBuffer = bytesBuffered - bytesConsumed;
 									if (bytesInBuffer > 1) {
 										if (buffer[bytesConsumed] != (byte)'\r' || buffer[bytesConsumed + 1] != (byte)'\n') {
-											Console.WriteLine($"Unexpected chunk end {buffer[bytesConsumed]:x2} {buffer[bytesConsumed + 1]:x2}");
+											LogWarning($"Unexpected chunk end {buffer[bytesConsumed]:x2} {buffer[bytesConsumed + 1]:x2}");
 											ArrayPool<byte>.Shared.Return(buffer2);
 											ArrayPool<byte>.Shared.Return(buffer);
 											socket.Close();
@@ -363,14 +432,14 @@ namespace HttpTransportProxy {
 									bytesIndex -= bytesConsumed;
 									bytesConsumed = 0;
 
-									var bytesRead = await stream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
+									var bytesRead = await sourceStream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
 									if (bytesRead == 0) {
-										Console.WriteLine("Client closed the connection");
+										LogWarning("Client closed the connection");
 										unexpectedClose = true;
 										break;
 									}
 									bytesBuffered = bytesInBuffer + bytesRead;
-									await remoteStream.WriteAsync(buffer, bytesInBuffer, bytesRead);
+									await targetStream.WriteAsync(buffer, bytesInBuffer, bytesRead);
 								}
 							}
 							while (true);
@@ -385,7 +454,7 @@ namespace HttpTransportProxy {
 							if (!isEnd || getMoreData) {
 								ArrayPool<byte>.Shared.Return(buffer2);
 								ArrayPool<byte>.Shared.Return(buffer);
-								Console.WriteLine("Unexpected request from client");
+								LogWarning("Unexpected request from client");
 								socket.Close();
 								return;
 							}
@@ -393,7 +462,7 @@ namespace HttpTransportProxy {
 							if (bytesBuffered - bytesConsumed > 0) {
 								ArrayPool<byte>.Shared.Return(buffer2);
 								ArrayPool<byte>.Shared.Return(buffer);
-								Console.WriteLine("Unexpected request from client");
+								LogWarning("Unexpected request from client");
 								socket.Close();
 								return;
 							}
@@ -402,22 +471,22 @@ namespace HttpTransportProxy {
 							// write remaining data
 							if (bytesBuffered - bytesConsumed > 0) {
 								requestLength += (bytesBuffered - bytesConsumed);
-								await remoteStream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
+								await targetStream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
 							}
 
 							// read remaining data
 							while (requestLength < contentLength) {
-								var bytesRead = await stream.ReadAsync(buffer);
+								var bytesRead = await sourceStream.ReadAsync(buffer);
 								if (bytesRead == 0) {
 									break;
 								}
 
 								requestLength += bytesRead;
-								await remoteStream.WriteAsync(buffer, 0, bytesRead);
+								await targetStream.WriteAsync(buffer, 0, bytesRead);
 							}
 
 							if (requestLength != contentLength) {
-								Console.WriteLine($"Unexpected request length '{requestLength}' expected '{contentLength}'");
+								LogWarning($"Unexpected request length '{requestLength}' expected '{contentLength}'");
 								ArrayPool<byte>.Shared.Return(buffer2);
 								ArrayPool<byte>.Shared.Return(buffer);
 								socket.Close();
@@ -427,7 +496,7 @@ namespace HttpTransportProxy {
 
 						if (isContinue) {
 							if (requestLength != 0) {
-								Console.WriteLine($"Unexpected request length '{requestLength}' for request with 'Expect: 100-continue'");
+								LogWarning($"Unexpected request length '{requestLength}' for request with 'Expect: 100-continue'");
 								ArrayPool<byte>.Shared.Return(buffer2);
 								ArrayPool<byte>.Shared.Return(buffer);
 								socket.Close();
@@ -454,9 +523,9 @@ namespace HttpTransportProxy {
 							bytesIndex -= bytesConsumed;
 							bytesConsumed = 0;
 
-							var bytesRead = await remoteStream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
+							var bytesRead = await targetStream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
 							if (bytesRead == 0) {
-								Console.WriteLine("Server closed the connection");
+								LogWarning("Server closed the connection");
 								unexpectedClose = true;
 								break;
 							}
@@ -501,7 +570,7 @@ namespace HttpTransportProxy {
 						if (responseHeaders.Count == 0 || !isEnd) {
 							ArrayPool<byte>.Shared.Return(buffer2);
 							ArrayPool<byte>.Shared.Return(buffer);
-							Console.WriteLine("Unexpected response from server");
+							LogWarning("Unexpected response from server");
 							socket.Close();
 							return;
 						}
@@ -511,7 +580,7 @@ namespace HttpTransportProxy {
 							if (line.StartsWith("Content-Length: ", StringComparison.Ordinal)) {
 								if (!long.TryParse(line.Substring("Content-Length: ".Length), NumberStyles.None, CultureInfo.InvariantCulture, out contentLength)) {
 									ArrayPool<byte>.Shared.Return(buffer);
-									Console.WriteLine($"Failed to parse content length '{line}'");
+									LogWarning($"Failed to parse content length '{line}'");
 									socket.Close();
 									return;
 								}
@@ -521,7 +590,7 @@ namespace HttpTransportProxy {
 							}
 							// rewrite redirects
 							//else if (line.StartsWith("Location: ", StringComparison.Ordinal)) {
-							//	var target = line.Substring(10);
+							//	var target = line.Substring(10).TrimEnd('/');
 							//	IProxyConfiguration proxy2 = null;
 							//	foreach (var s in _settings.Proxy) {
 							//		if (target.StartsWith(s.Target, StringComparison.OrdinalIgnoreCase) && (s.Target.Length == target.Length || target[s.Target.Length] == '/')) {
@@ -530,7 +599,7 @@ namespace HttpTransportProxy {
 							//		}
 							//	}
 							//	if (proxy2 != null) {
-							//		responseHeaders[i] = "Location: " + CommonUtility.CombineWithSlash("http://" + originalHost, proxy2.Path, target.Substring(proxy2.Target.Length));
+							//		responseHeaders[i] = "Location: " + CommonUtility.CombineWithSlash((certificate != null ? Uri.UriSchemeHttps : Uri.UriSchemeHttp) + "://" + originalHost, proxy2.Path, target.Substring(proxy2.Target.Length));
 							//	}
 							//}
 						}
@@ -545,11 +614,11 @@ namespace HttpTransportProxy {
 							int l = Encoding.UTF8.GetBytes(header, buffer2);
 							buffer2[l] = (byte)'\r';
 							buffer2[l + 1] = (byte)'\n';
-							await stream.WriteAsync(buffer2, 0, l + 2);
+							await sourceStream.WriteAsync(buffer2, 0, l + 2);
 						}
 						buffer2[0] = (byte)'\r';
 						buffer2[1] = (byte)'\n';
-						await stream.WriteAsync(buffer2, 0, 2);
+						await sourceStream.WriteAsync(buffer2, 0, 2);
 
 						ArrayPool<byte>.Shared.Return(buffer2);
 
@@ -557,7 +626,7 @@ namespace HttpTransportProxy {
 							// write remaining data
 							if (bytesBuffered - bytesConsumed > 0) {
 								responseLength += (bytesBuffered - bytesConsumed);
-								await stream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
+								await sourceStream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
 							}
 
 							int chunkCount = 0;
@@ -582,7 +651,7 @@ namespace HttpTransportProxy {
 												bytesIndex = bytesConsumed;
 												isStart = false;
 												if (line.Length == 0 || !long.TryParse(line, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out chunkSize) || chunkSize < 0) {
-													Console.WriteLine($"Unexpected chunk size {line}");
+													LogWarning($"Unexpected chunk size {line}");
 													ArrayPool<byte>.Shared.Return(buffer);
 													socket.Close();
 													return;
@@ -599,7 +668,7 @@ namespace HttpTransportProxy {
 									var bytesInBuffer = bytesBuffered - bytesConsumed;
 									if (bytesInBuffer > 1) {
 										if (buffer[bytesConsumed] != (byte)'\r' || buffer[bytesConsumed + 1] != (byte)'\n') {
-											Console.WriteLine($"Unexpected chunk end {buffer[bytesConsumed]:x2} {buffer[bytesConsumed + 1]:x2}");
+											LogWarning($"Unexpected chunk end {buffer[bytesConsumed]:x2} {buffer[bytesConsumed + 1]:x2}");
 											ArrayPool<byte>.Shared.Return(buffer);
 											socket.Close();
 											return;
@@ -650,14 +719,14 @@ namespace HttpTransportProxy {
 									bytesIndex -= bytesConsumed;
 									bytesConsumed = 0;
 
-									var bytesRead = await remoteStream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
+									var bytesRead = await targetStream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
 									if (bytesRead == 0) {
-										Console.WriteLine("Server closed the connection");
+										LogWarning("Server closed the connection");
 										unexpectedClose = true;
 										break;
 									}
 									bytesBuffered = bytesInBuffer + bytesRead;
-									await stream.WriteAsync(buffer, bytesInBuffer, bytesRead);
+									await sourceStream.WriteAsync(buffer, bytesInBuffer, bytesRead);
 								}
 							}
 							while (true);
@@ -670,14 +739,14 @@ namespace HttpTransportProxy {
 
 							if (!isEnd || getMoreData) {
 								ArrayPool<byte>.Shared.Return(buffer);
-								Console.WriteLine("Unexpected response from server");
+								LogWarning("Unexpected response from server");
 								socket.Close();
 								return;
 							}
 
 							if (bytesBuffered - bytesConsumed > 0) {
 								ArrayPool<byte>.Shared.Return(buffer);
-								Console.WriteLine("Unexpected response from server");
+								LogWarning("Unexpected response from server");
 								socket.Close();
 								return;
 							}
@@ -686,31 +755,40 @@ namespace HttpTransportProxy {
 							// write remaining data
 							if (bytesBuffered - bytesConsumed > 0) {
 								responseLength += (bytesBuffered - bytesConsumed);
-								await stream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
+								await sourceStream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
 							}
 
 							// read remaining data
 							while (responseLength < contentLength) {
-								var bytesRead = await remoteStream.ReadAsync(buffer);
+								var bytesRead = await targetStream.ReadAsync(buffer);
 								if (bytesRead == 0) {
 									break;
 								}
 
 								responseLength += bytesRead;
-								await stream.WriteAsync(buffer, 0, bytesRead);
+								await sourceStream.WriteAsync(buffer, 0, bytesRead);
 							}
 
 							if (contentLength != responseLength) {
-								Console.WriteLine($"Unexpected response length {responseLength} expected {contentLength}");
+								LogWarning($"Unexpected response length {responseLength} expected {contentLength}");
 							}
+						}
+
+						if (targetSslStream != null) {
+							await targetSslStream.DisposeAsync();
 						}
 					}
 				}
 
 				ArrayPool<byte>.Shared.Return(buffer);
+
+				if (sourceSslStream != null) {
+					await sourceSslStream.DisposeAsync();
+				}
+
 				socket.Close();
 			}
-			Console.WriteLine("Request completed");
+			LogInformation("Request completed");
 		}
 
 		private static IFarmSettings GetFarSettings(IConfiguration config) {
@@ -790,6 +868,187 @@ namespace HttpTransportProxy {
 				}
 			}
 			return certificate;
+		}
+
+
+		private static void LogInvalidCertificate(X509Certificate certificate, SslPolicyErrors sslPolicyErrors, X509Chain chain) {
+			string policy = string.Empty;
+			if (chain != null && chain.ChainPolicy != null) {
+				policy = "RevocationMode: " + chain.ChainPolicy.RevocationMode + ", RevocationFlag: " + chain.ChainPolicy.RevocationFlag + ", VerificationFlags: " + chain.ChainPolicy.VerificationFlags;
+			}
+
+			string chainErrors = string.Empty;
+			if ((sslPolicyErrors & SslPolicyErrors.RemoteCertificateChainErrors) != 0) {
+				if (chain != null && chain.ChainStatus != null) {
+					foreach (X509ChainStatus status in chain.ChainStatus) {
+						if (!string.IsNullOrEmpty(chainErrors)) {
+							chainErrors += "\r\n";
+						}
+						chainErrors += status.Status.ToString() + ": " + status.StatusInformation;
+					}
+				}
+			}
+
+			string chainElements = string.Empty;
+			for (var i = 0; i < chain.ChainElements.Count; i++) {
+				X509ChainElement cel = chain.ChainElements[i];
+				if (cel.ChainElementStatus != null && cel.ChainElementStatus.Length > 0) {
+					if (!string.IsNullOrEmpty(chainElements)) {
+						chainElements += "\r\n";
+					}
+
+					string cName = string.Empty;
+					if (cel.Certificate != null) {
+						cName = cel.Certificate.Subject;
+					}
+
+					chainElements += cName + ":";
+
+					foreach (X509ChainStatus status in cel.ChainElementStatus) {
+						if (status.Status == X509ChainStatusFlags.NotTimeValid && cel.Certificate != null) {
+							chainElements += "\r\n" + status.Status.ToString() + ": " + cel.Certificate.NotBefore.ToString("yyyy-MM-dd HH:mm:ss") + " - " + cel.Certificate.NotAfter.ToString("yyyy-MM-dd HH:mm:ss") + ": " + status.StatusInformation;
+						}
+						else {
+							chainElements += "\r\n" + status.Status.ToString() + ": " + status.StatusInformation;
+						}
+					}
+				}
+			}
+
+			LogWarning(string.Format("Failed to validate certificate '{0}'. policy: {1}, errorType: {2}\r\nchainErrors:\r\n{3}\r\nchainElements:\r\n{4}", certificate.Subject, policy, sslPolicyErrors.ToString(), chainErrors, chainElements));
+		}
+
+		private static void LogInvalidCertificate(X509Certificate certificate, X509Chain chain) {
+			string policyInfo = string.Empty;
+			if (chain.ChainPolicy != null) {
+				policyInfo = "RevocationMode: " + chain.ChainPolicy.RevocationMode + ", RevocationFlag: " + chain.ChainPolicy.RevocationFlag + ", VerificationFlags: " + chain.ChainPolicy.VerificationFlags;
+			}
+
+			string chainErrors = string.Empty;
+			if (chain.ChainStatus != null) {
+				foreach (X509ChainStatus status in chain.ChainStatus) {
+					if (!string.IsNullOrEmpty(chainErrors)) {
+						chainErrors += "\r\n";
+					}
+					chainErrors += status.Status.ToString() + ": " + status.StatusInformation;
+				}
+			}
+
+			string chainElements = string.Empty;
+			for (var i = 0; i < chain.ChainElements.Count; i++) {
+				X509ChainElement cel = chain.ChainElements[i];
+				if (cel.ChainElementStatus != null && cel.ChainElementStatus.Length > 0) {
+					if (!string.IsNullOrEmpty(chainElements)) {
+						chainElements += "\r\n";
+					}
+
+					string cName = string.Empty;
+					if (cel.Certificate != null) {
+						cName = cel.Certificate.Subject;
+					}
+
+					chainElements += cName + ":";
+
+					foreach (X509ChainStatus status in cel.ChainElementStatus) {
+						if (status.Status == X509ChainStatusFlags.NotTimeValid && cel.Certificate != null) {
+							chainElements += "\r\n" + status.Status.ToString() + ": " + cel.Certificate.NotBefore.ToString("yyyy-MM-dd HH:mm:ss") + " - " + cel.Certificate.NotAfter.ToString("yyyy-MM-dd HH:mm:ss") + ": " + status.StatusInformation;
+						}
+						else {
+							chainElements += "\r\n" + status.Status.ToString() + ": " + status.StatusInformation;
+						}
+					}
+				}
+			}
+
+			LogWarning(string.Format("Failed to validate certificate '{0}'. policy: {1}\r\nchainErrors:\r\n{2}\r\nchainElements:\r\n{3}", certificate.Subject, policyInfo, chainErrors, chainElements));
+		}
+
+		private static void LogValidCertificate(X509Certificate certificate, X509Chain chain) {
+			string policy = string.Empty;
+			if (chain != null && chain.ChainPolicy != null) {
+				policy = "RevocationMode: " + chain.ChainPolicy.RevocationMode + ", RevocationFlag: " + chain.ChainPolicy.RevocationFlag + ", VerificationFlags: " + chain.ChainPolicy.VerificationFlags;
+			}
+			LogDebug(string.Format("Successfully validated certificate '{0}'. policy: {1}", certificate.Subject, policy));
+		}
+
+		private static bool ValidateServerCertificate(X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors, IProxyConfiguration proxy) {
+			// special handling for IP SAN
+			if (sslPolicyErrors == SslPolicyErrors.RemoteCertificateNameMismatch) {
+				var certificate2 = (X509Certificate2)certificate;
+
+				X509Chain chain2 = new X509Chain();
+				chain2.ChainPolicy = chain.ChainPolicy;
+				var result = chain2.Build(certificate2);
+				if (!result) {
+					LogInvalidCertificate(certificate, chain2);
+					return false;
+				}
+
+				HashSet<string> serverIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+				HashSet<string> serverNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+				var uccSan = certificate2.Extensions["2.5.29.17"];
+				if (uccSan != null) {
+					foreach (string nvp in uccSan.Format(true).Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)) {
+						if (nvp.StartsWith("IP Address=", StringComparison.Ordinal)) {
+							var serverName = nvp.Substring(11);
+							if (!serverIps.Contains(serverName)) {
+								serverIps.Add(serverName);
+							}
+						}
+						else if (nvp.StartsWith("DNS Name=", StringComparison.Ordinal)) {
+							var serverName = nvp.Substring(9);
+							if (!serverIps.Contains(serverName)) {
+								serverNames.Add(serverName);
+							}
+						}
+					}
+				}
+
+				int end = proxy.Target.IndexOf("/", 8);
+				string proxyHost = end > 0 ? proxy.Target.Substring(8, end - 8) : proxy.Target.Substring(8);
+				if (!serverIps.Contains(proxyHost) && !(!string.IsNullOrEmpty(proxy.OverrideHost) && serverNames.Contains(proxy.OverrideHost))) {
+					LogWarning(string.Format("Failed to validate certificate '{0}'. expected: {1}" + (string.IsNullOrEmpty(proxy.OverrideHost) ? string.Empty : " or {2}") + ", serverIps: [{3}], serverNames: [{4}]", certificate.Subject, proxyHost, proxy.OverrideHost, string.Join(", ", serverIps), string.Join(", ", serverNames)));
+					return false;
+				}
+
+				LogValidCertificate(certificate, chain);
+				return true;
+			}
+			// regular certificate validation
+			if (sslPolicyErrors != SslPolicyErrors.None) {
+				LogInvalidCertificate(certificate, sslPolicyErrors, chain);
+				return false;
+			}
+			LogValidCertificate(certificate, chain);
+			return true;
+		}
+
+		private static readonly object _syncRoot = new object();
+		private static void LogDebug(string message) {
+			lock (_syncRoot) {
+				var color = Console.ForegroundColor;
+				Console.ForegroundColor = ConsoleColor.Gray;
+				Console.WriteLine(message);
+				Console.ForegroundColor = color;
+			}
+		}
+
+		private static void LogWarning(string message) {
+			lock (_syncRoot) {
+				var color = Console.ForegroundColor;
+				Console.ForegroundColor = ConsoleColor.Red;
+				Console.WriteLine(message);
+				Console.ForegroundColor = color;
+			}
+		}
+
+		private static void LogInformation(string message) {
+			lock (_syncRoot) {
+				var color = Console.ForegroundColor;
+				Console.ForegroundColor = ConsoleColor.White;
+				Console.WriteLine(message);
+				Console.ForegroundColor = color;
+			}
 		}
 	}
 }
