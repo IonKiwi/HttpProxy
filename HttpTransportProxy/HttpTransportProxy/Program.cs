@@ -5,6 +5,7 @@ using Microsoft.Extensions.Configuration;
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -104,691 +105,610 @@ namespace HttpTransportProxy {
 		private static async Task HandleConnectionInternal(Socket socket, X509Certificate2 certificate) {
 			LogInformation($"Accepted connection from {socket.RemoteEndPoint}");
 
-			byte[] buffer = ArrayPool<byte>.Shared.Rent(1024);
-			int bytesBuffered = 0, bytesConsumed = 0, bytesIndex = 0;
-			bool unexpectedClose = false, isEnd = false;
-			List<string> headers = new List<string>(10);
-			long requestLength = 0;
-			using (var clientStream = new NetworkStream(socket, FileAccess.ReadWrite, false)) {
-				Stream sourceStream = clientStream;
-				SslStream sourceSslStream = null;
-				if (certificate != null) {
-					sourceStream = sourceSslStream = new SslStream(clientStream, true);
-					var protocols = SslProtocols.Tls12;
-					if (!_isWindows) {
-						protocols |= SslProtocols.Tls13;
-					}
-					//CipherSuitesPolicy policy = new CipherSuitesPolicy(new[] {
-					//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-					//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-					//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-					//	TlsCipherSuite.TLS_AES_128_GCM_SHA256,
-					//	TlsCipherSuite.TLS_AES_256_GCM_SHA384,
-					//	TlsCipherSuite.TLS_CHACHA20_POLY1305_SHA256,
-					//});
-					await sourceSslStream.AuthenticateAsServerAsync(new SslServerAuthenticationOptions() {
-						ApplicationProtocols = new List<SslApplicationProtocol>() {
+			List<string> requestHeaders = new List<string>(10);
+			List<string> responseHeaders = new List<string>(10);
+			long requestContentLength = 0, responseContentLength = 0;
+			ReadState requestState = new ReadState();
+			ReadState responseState = new ReadState();
+			try {
+				using (var clientStream = new NetworkStream(socket, FileAccess.ReadWrite, false)) {
+					Stream sourceStream = clientStream;
+					SslStream sourceSslStream = null;
+					if (certificate != null) {
+						sourceStream = sourceSslStream = new SslStream(clientStream, true);
+						var protocols = SslProtocols.Tls12;
+						if (!_isWindows) {
+							protocols |= SslProtocols.Tls13;
+						}
+						//CipherSuitesPolicy policy = new CipherSuitesPolicy(new[] {
+						//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+						//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+						//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+						//	TlsCipherSuite.TLS_AES_128_GCM_SHA256,
+						//	TlsCipherSuite.TLS_AES_256_GCM_SHA384,
+						//	TlsCipherSuite.TLS_CHACHA20_POLY1305_SHA256,
+						//});
+						await sourceSslStream.AuthenticateAsServerAsync(new SslServerAuthenticationOptions() {
+							ApplicationProtocols = new List<SslApplicationProtocol>() {
 							SslApplicationProtocol.Http11,
 							//SslApplicationProtocol.Http2
 						},
-						ClientCertificateRequired = false,
-						EnabledSslProtocols = protocols,
-						ServerCertificate = certificate,
-						AllowRenegotiation = false,
-						CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
-						EncryptionPolicy = EncryptionPolicy.RequireEncryption,
-					});
-				}
-
-				while (!isEnd /*&& stream.DataAvailable*/) {
-					var bytesInBuffer = bytesBuffered - bytesConsumed;
-					if (bytesInBuffer > (buffer.Length / 2)) {
-						// expand buffer
-						var newBuffer = ArrayPool<byte>.Shared.Rent((buffer.Length < (int.MaxValue / 2)) ? buffer.Length * 2 : int.MaxValue);
-						// copy the unprocessed data
-						Buffer.BlockCopy(buffer, bytesConsumed, newBuffer, 0, bytesInBuffer);
-						ArrayPool<byte>.Shared.Return(buffer);
-						buffer = newBuffer;
-					}
-					else if (bytesInBuffer > 0) {
-						Buffer.BlockCopy(buffer, bytesConsumed, buffer, 0, bytesInBuffer);
-					}
-					bytesIndex -= bytesConsumed;
-					bytesConsumed = 0;
-
-					var bytesRead = await sourceStream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
-					if (bytesRead == 0) {
-						LogWarning("Client closed the connection");
-						unexpectedClose = true;
-						break;
+							ClientCertificateRequired = false,
+							EnabledSslProtocols = protocols,
+							ServerCertificate = certificate,
+							AllowRenegotiation = false,
+							CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+							EncryptionPolicy = EncryptionPolicy.RequireEncryption,
+						});
 					}
 
-					bytesBuffered = bytesInBuffer + bytesRead;
+					requestState.buffer = ArrayPool<byte>.Shared.Rent(1024);
+					requestState.bytesBuffered = 0;
+					requestState.bytesConsumed = 0;
+					requestState.bytesIndex = 0;
 
-					// look for CRLF | RFC 2616
-					int linePosition;
-					do {
-						linePosition = Array.IndexOf(buffer, (byte)'\n', bytesIndex, bytesBuffered - bytesIndex);
-						if (linePosition >= 0) {
-							if (linePosition == 0 || buffer[linePosition - 1] != (byte)'\r') {
-								bytesIndex = linePosition + 1;
-							}
-							else {
-								var count = linePosition - bytesConsumed - 1;
-								if (count > 0) {
-									var line = Encoding.UTF8.GetString(buffer, bytesConsumed, count);
-									headers.Add(line);
-									bytesConsumed = linePosition + 1;
-								}
-								else {
-									bytesConsumed = linePosition + 1;
-									bytesIndex = bytesConsumed;
-									isEnd = true;
-									break;
-								}
-								bytesIndex = linePosition + 1;
-							}
+					var status = await ReadHeaderData(sourceStream, requestState, requestHeaders);
+					if (status != ReadDataStatus.Completed) {
+						LogRequestStatus(status);
+						return;
+					}
+
+					int i = requestHeaders[0].IndexOf(' ');
+					if (i < 0) {
+						LogWarning("Unexpected request from client");
+						return;
+					}
+
+					string verb = requestHeaders[0].Substring(0, i);
+					int i2 = requestHeaders[0].IndexOf(' ', i + 1);
+					if (i2 < 0) {
+						LogWarning("Unexpected request from client");
+						return;
+					}
+
+					string destination = requestHeaders[0].Substring(i + 1, i2 - i - 1);
+
+					// select proxy
+					IProxyConfiguration proxy = null;
+					foreach (var s in _settings.Proxy) {
+						if (destination.StartsWith(s.Path, StringComparison.OrdinalIgnoreCase) && (s.Path.Length == destination.Length || destination[s.Path.Length] == '/')) {
+							proxy = s;
+							break;
 						}
 					}
-					while (linePosition >= 0);
-				}
 
-				if (unexpectedClose) {
-					ArrayPool<byte>.Shared.Return(buffer);
-					socket.Close();
-					return;
-				}
-
-				if (headers.Count == 0 || !isEnd) {
-					ArrayPool<byte>.Shared.Return(buffer);
-					LogWarning("Unexpected request from client");
-					socket.Close();
-					return;
-				}
-
-				int i = headers[0].IndexOf(' ');
-				if (i < 0) {
-					ArrayPool<byte>.Shared.Return(buffer);
-					LogWarning("Unexpected request from client");
-					socket.Close();
-					return;
-				}
-
-				string verb = headers[0].Substring(0, i);
-				int i2 = headers[0].IndexOf(' ', i + 1);
-				if (i2 < 0) {
-					ArrayPool<byte>.Shared.Return(buffer);
-					LogWarning("Unexpected request from client");
-					socket.Close();
-					return;
-				}
-
-				string destination = headers[0].Substring(i + 1, i2 - i - 1);
-
-				// select proxy
-				IProxyConfiguration proxy = null;
-				foreach (var s in _settings.Proxy) {
-					if (destination.StartsWith(s.Path, StringComparison.OrdinalIgnoreCase) && (s.Path.Length == destination.Length || destination[s.Path.Length] == '/')) {
-						proxy = s;
-						break;
+					if (proxy == null) {
+						LogWarning($"No proxy configuration for request to {destination}");
+						return;
 					}
-				}
 
-				if (proxy == null) {
-					ArrayPool<byte>.Shared.Return(buffer);
-					LogWarning($"No proxy configuration for request to {destination}");
-					socket.Close();
-					return;
-				}
+					var path = CommonUtility.CombineWithSlash("/", destination.Substring(proxy.Path.Length));
+					requestHeaders[0] = verb + " " + path + requestHeaders[0].Substring(i2);
 
-				var path = CommonUtility.CombineWithSlash("/", destination.Substring(proxy.Path.Length));
-				headers[0] = verb + " " + path + headers[0].Substring(i2);
-
-				var targetUri = new Uri(proxy.Target, UriKind.Absolute);
-				bool isContinue = false, isChunked = false;
-				long contentLength = 0;
-				string originalHost = null;
-				for (i = 0; i < headers.Count; i++) {
-					var line = headers[i];
-					if (string.Equals("Expect: 100-continue", line, StringComparison.Ordinal)) {
-						isContinue = true;
+					var targetUri = new Uri(proxy.Target, UriKind.Absolute);
+					bool isContinue, isRequestChunked;
+					string originalHost;
+					// process request headers
+					if (!ProcessRequestHeaders(requestHeaders, targetUri, out originalHost, out isContinue, out isRequestChunked, out requestContentLength)) {
+						return;
 					}
-					else if (line.StartsWith("Content-Length: ", StringComparison.Ordinal)) {
-						if (!long.TryParse(line.Substring("Content-Length: ".Length), NumberStyles.None, CultureInfo.InvariantCulture, out contentLength)) {
-							ArrayPool<byte>.Shared.Return(buffer);
-							LogWarning($"Failed to parse content length '{line}'");
-							socket.Close();
-							return;
-						}
-					}
-					else if (string.Equals("Transfer-Encoding: chunked", line, StringComparison.OrdinalIgnoreCase)) {
-						isChunked = true;
-					}
-					else if (line.StartsWith("Host: ", StringComparison.Ordinal)) {
-						originalHost = line.Substring(6);
-						headers[i] = "Host: " + targetUri.Host + (targetUri.IsDefaultPort ? string.Empty : ":" + targetUri.Port.ToString(CultureInfo.InvariantCulture));
-					}
-				}
 
-				IPAddress[] serverIps = Dns.GetHostAddresses(targetUri.DnsSafeHost);
-				if (serverIps == null || serverIps.Length == 0) {
-					ArrayPool<byte>.Shared.Return(buffer);
-					LogWarning($"Failed to resolve addresses of {proxy.Target}");
-					socket.Close();
-					return;
-				}
-				int connectPort = targetUri.Port;
-				using (var remoteSocket = new Socket(SocketType.Stream, ProtocolType.Tcp)) {
-					await remoteSocket.ConnectAsync(serverIps, connectPort);
+					IPAddress[] serverIps = Dns.GetHostAddresses(targetUri.DnsSafeHost);
+					if (serverIps == null || serverIps.Length == 0) {
+						LogWarning($"Failed to resolve addresses of {proxy.Target}");
+						return;
+					}
+					int connectPort = targetUri.Port;
+					using (var remoteSocket = new Socket(SocketType.Stream, ProtocolType.Tcp)) {
+						await remoteSocket.ConnectAsync(serverIps, connectPort);
 
-					using (var remoteStream = new NetworkStream(remoteSocket, FileAccess.ReadWrite, false)) {
-						Stream targetStream = remoteStream;
-						SslStream targetSslStream = null;
-						if (targetUri.Scheme == Uri.UriSchemeHttps) {
-							targetStream = targetSslStream = new SslStream(remoteStream, true);
-							var protocols = SslProtocols.Tls12;
-							if (!_isWindows) {
-								protocols |= SslProtocols.Tls13;
-							}
-							//CipherSuitesPolicy policy = new CipherSuitesPolicy(new[] {
-							//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-							//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-							//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-							//	TlsCipherSuite.TLS_AES_128_GCM_SHA256,
-							//	TlsCipherSuite.TLS_AES_256_GCM_SHA384,
-							//	TlsCipherSuite.TLS_CHACHA20_POLY1305_SHA256,
-							//});
-							await targetSslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions() {
-								AllowRenegotiation = false,
-								ApplicationProtocols = new List<SslApplicationProtocol>() {
+						using (var remoteStream = new NetworkStream(remoteSocket, FileAccess.ReadWrite, false)) {
+							Stream targetStream = remoteStream;
+							SslStream targetSslStream = null;
+							if (targetUri.Scheme == Uri.UriSchemeHttps) {
+								targetStream = targetSslStream = new SslStream(remoteStream, true);
+								var protocols = SslProtocols.Tls12;
+								if (!_isWindows) {
+									protocols |= SslProtocols.Tls13;
+								}
+								//CipherSuitesPolicy policy = new CipherSuitesPolicy(new[] {
+								//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+								//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+								//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+								//	TlsCipherSuite.TLS_AES_128_GCM_SHA256,
+								//	TlsCipherSuite.TLS_AES_256_GCM_SHA384,
+								//	TlsCipherSuite.TLS_CHACHA20_POLY1305_SHA256,
+								//});
+								await targetSslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions() {
+									AllowRenegotiation = false,
+									ApplicationProtocols = new List<SslApplicationProtocol>() {
 									SslApplicationProtocol.Http11,
 									//SslApplicationProtocol.Http2
 								},
-								CertificateRevocationCheckMode = X509RevocationMode.Online,
-								//CipherSuitesPolicy = policy,
-								EnabledSslProtocols = protocols,
-								EncryptionPolicy = EncryptionPolicy.RequireEncryption,
-								TargetHost = targetUri.Host,
-								RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => ValidateServerCertificate(certificate, chain, sslPolicyErrors, proxy)
-							});
-						}
-
-						List<string> responseHeaders = new List<string>(10);
-						long responseLength = 0;
-						var buffer2 = ArrayPool<byte>.Shared.Rent(1024);
-
-						// write headers
-						foreach (var header in headers) {
-							var b = Encoding.UTF8.GetByteCount(header) + 2;
-							if (b > buffer2.Length) {
-								ArrayPool<byte>.Shared.Return(buffer2);
-								buffer2 = ArrayPool<byte>.Shared.Rent(b);
-							}
-							int l = Encoding.UTF8.GetBytes(header, buffer2);
-							buffer2[l] = (byte)'\r';
-							buffer2[l + 1] = (byte)'\n';
-							await targetStream.WriteAsync(buffer2, 0, l + 2);
-						}
-						buffer2[0] = (byte)'\r';
-						buffer2[1] = (byte)'\n';
-						await targetStream.WriteAsync(buffer2, 0, 2);
-
-						if (isChunked) {
-							// write remaining data
-							if (bytesBuffered - bytesConsumed > 0) {
-								responseLength += (bytesBuffered - bytesConsumed);
-								await targetStream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
+									CertificateRevocationCheckMode = X509RevocationMode.Online,
+									//CipherSuitesPolicy = policy,
+									EnabledSslProtocols = protocols,
+									EncryptionPolicy = EncryptionPolicy.RequireEncryption,
+									TargetHost = targetUri.Host,
+									RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => ValidateServerCertificate(certificate, chain, sslPolicyErrors, proxy)
+								});
 							}
 
-							int chunkCount = 0;
-							long chunkSize = 0, chunkLength = 0;
-							bool isStart = true, getMoreData = true;
-							isEnd = false;
-							bytesIndex = bytesConsumed;
-							do {
-								if (isStart) {
-									getMoreData = true;
-									// look for CRLF
-									int linePosition;
-									do {
-										linePosition = Array.IndexOf(buffer, (byte)'\n', bytesIndex, bytesBuffered - bytesIndex);
-										if (linePosition >= 0) {
-											if (linePosition == 0 || buffer[linePosition - 1] != (byte)'\r') {
-												bytesIndex = linePosition + 1;
-											}
-											else {
-												var line = Encoding.UTF8.GetString(buffer, bytesConsumed, linePosition - bytesConsumed - 1);
-												bytesConsumed = linePosition + 1;
-												bytesIndex = bytesConsumed;
-												isStart = false;
-												if (line.Length == 0 || !long.TryParse(line, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out chunkSize) || chunkSize < 0) {
-													LogWarning($"Unexpected chunk size {line}");
-													ArrayPool<byte>.Shared.Return(buffer2);
-													ArrayPool<byte>.Shared.Return(buffer);
-													socket.Close();
-													return;
-												}
-												getMoreData = false;
-												break;
-											}
-										}
-									}
-									while (linePosition >= 0);
+							responseState.buffer = ArrayPool<byte>.Shared.Rent(1024);
+							responseState.bytesBuffered = 0;
+							responseState.bytesConsumed = 0;
+							responseState.bytesIndex = 0;
+
+							if (isContinue) {
+								await WriteHeaders(requestHeaders, targetStream);
+
+								status = await ReadHeaderData(targetStream, responseState, responseHeaders);
+								if (status != ReadDataStatus.Completed) {
+									LogResponseStatus(status);
+									return;
 								}
-								else if (isEnd) {
-									getMoreData = true;
-									var bytesInBuffer = bytesBuffered - bytesConsumed;
-									if (bytesInBuffer > 1) {
-										if (buffer[bytesConsumed] != (byte)'\r' || buffer[bytesConsumed + 1] != (byte)'\n') {
-											LogWarning($"Unexpected chunk end {buffer[bytesConsumed]:x2} {buffer[bytesConsumed + 1]:x2}");
-											ArrayPool<byte>.Shared.Return(buffer2);
-											ArrayPool<byte>.Shared.Return(buffer);
-											socket.Close();
-											return;
-										}
-										chunkCount++;
-										if (chunkSize == 0) {
-											bytesConsumed += 2;
-											bytesIndex = bytesConsumed;
-											getMoreData = false;
-											break;
-										}
-										isEnd = false;
-										isStart = true;
-										bytesConsumed += 2;
-										bytesIndex = bytesConsumed;
-										responseLength += chunkSize;
-										chunkLength = 0;
-										chunkSize = 0;
-										getMoreData = false;
+
+								bool isServerContinue = false;
+								if (string.Equals(responseHeaders[0], "HTTP/1.1 100 Continue", StringComparison.Ordinal)) {
+									isServerContinue = true;
+								}
+								//else if (string.Equals(responseHeaders[0], "HTTP/1.1 417 Expectation Failed", StringComparison.Ordinal)) {
+								//	isServerContinue = false;
+								//}
+
+								bool isResponseChunked;
+								if (isServerContinue) {
+									await WriteHeaders(responseHeaders, sourceStream);
+
+									var status2 = await ReadBodyData(sourceStream, targetStream, requestState, isRequestChunked, requestContentLength);
+									if (status2.status != ReadDataStatus.Completed) {
+										LogRequestStatus(status2, requestState, requestContentLength);
+										return;
 									}
+
+									responseHeaders.Clear();
+									status = await ReadHeaderData(targetStream, responseState, responseHeaders);
+									if (status != ReadDataStatus.Completed) {
+										LogResponseStatus(status);
+										return;
+									}
+
+									if (!ProcessResponseHeaders(responseHeaders, certificate != null, originalHost, out isResponseChunked, out responseContentLength)) {
+										return;
+									}
+
+									await WriteHeaders(responseHeaders, sourceStream);
 								}
 								else {
-									var remaining = chunkSize - chunkLength;
-									var nextBlock = bytesBuffered - bytesConsumed;
-									if (nextBlock > remaining) {
-										nextBlock = (int)remaining;
+									if (!ProcessResponseHeaders(responseHeaders, certificate != null, originalHost, out isResponseChunked, out responseContentLength)) {
+										return;
 									}
-									bytesConsumed += nextBlock;
-									bytesIndex = bytesConsumed;
-									chunkLength += nextBlock;
-									isEnd = chunkLength == chunkSize;
-									getMoreData = !isEnd;
+
+									await WriteHeaders(responseHeaders, sourceStream);
 								}
 
-								if (getMoreData) {
-									var bytesInBuffer = bytesBuffered - bytesConsumed;
-									if (bytesInBuffer > (buffer.Length / 2)) {
-										// expand buffer
-										var newBuffer = ArrayPool<byte>.Shared.Rent((buffer.Length < (int.MaxValue / 2)) ? buffer.Length * 2 : int.MaxValue);
-										// copy the unprocessed data
-										Buffer.BlockCopy(buffer, bytesConsumed, newBuffer, 0, bytesInBuffer);
-										ArrayPool<byte>.Shared.Return(buffer);
-										buffer = newBuffer;
-									}
-									else if (bytesInBuffer > 0) {
-										Buffer.BlockCopy(buffer, bytesConsumed, buffer, 0, bytesInBuffer);
-									}
-									bytesIndex -= bytesConsumed;
-									bytesConsumed = 0;
-
-									var bytesRead = await sourceStream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
-									if (bytesRead == 0) {
-										LogWarning("Client closed the connection");
-										unexpectedClose = true;
-										break;
-									}
-									bytesBuffered = bytesInBuffer + bytesRead;
-									await targetStream.WriteAsync(buffer, bytesInBuffer, bytesRead);
-								}
-							}
-							while (true);
-
-							if (unexpectedClose) {
-								ArrayPool<byte>.Shared.Return(buffer2);
-								ArrayPool<byte>.Shared.Return(buffer);
-								socket.Close();
-								return;
-							}
-
-							if (!isEnd || getMoreData) {
-								ArrayPool<byte>.Shared.Return(buffer2);
-								ArrayPool<byte>.Shared.Return(buffer);
-								LogWarning("Unexpected request from client");
-								socket.Close();
-								return;
-							}
-
-							if (bytesBuffered - bytesConsumed > 0) {
-								ArrayPool<byte>.Shared.Return(buffer2);
-								ArrayPool<byte>.Shared.Return(buffer);
-								LogWarning("Unexpected request from client");
-								socket.Close();
-								return;
-							}
-						}
-						else {
-							// write remaining data
-							if (bytesBuffered - bytesConsumed > 0) {
-								requestLength += (bytesBuffered - bytesConsumed);
-								await targetStream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
-							}
-
-							// read remaining data
-							while (requestLength < contentLength) {
-								var bytesRead = await sourceStream.ReadAsync(buffer);
-								if (bytesRead == 0) {
-									break;
-								}
-
-								requestLength += bytesRead;
-								await targetStream.WriteAsync(buffer, 0, bytesRead);
-							}
-
-							if (requestLength != contentLength) {
-								LogWarning($"Unexpected request length '{requestLength}' expected '{contentLength}'");
-								ArrayPool<byte>.Shared.Return(buffer2);
-								ArrayPool<byte>.Shared.Return(buffer);
-								socket.Close();
-								return;
-							}
-						}
-
-						if (isContinue) {
-							if (requestLength != 0) {
-								LogWarning($"Unexpected request length '{requestLength}' for request with 'Expect: 100-continue'");
-								ArrayPool<byte>.Shared.Return(buffer2);
-								ArrayPool<byte>.Shared.Return(buffer);
-								socket.Close();
-								return;
-							}
-						}
-
-						// read response
-						bytesBuffered = bytesConsumed = bytesIndex = 0;
-						unexpectedClose = isEnd = false;
-						while (!isEnd /*&& remoteStream.DataAvailable*/) {
-							var bytesInBuffer = bytesBuffered - bytesConsumed;
-							if (bytesInBuffer > (buffer.Length / 2)) {
-								// expand buffer
-								var newBuffer = ArrayPool<byte>.Shared.Rent((buffer.Length < (int.MaxValue / 2)) ? buffer.Length * 2 : int.MaxValue);
-								// copy the unprocessed data
-								Buffer.BlockCopy(buffer, bytesConsumed, newBuffer, 0, bytesInBuffer);
-								ArrayPool<byte>.Shared.Return(buffer);
-								buffer = newBuffer;
-							}
-							else if (bytesInBuffer > 0) {
-								Buffer.BlockCopy(buffer, bytesConsumed, buffer, 0, bytesInBuffer);
-							}
-							bytesIndex -= bytesConsumed;
-							bytesConsumed = 0;
-
-							var bytesRead = await targetStream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
-							if (bytesRead == 0) {
-								LogWarning("Server closed the connection");
-								unexpectedClose = true;
-								break;
-							}
-
-							bytesBuffered = bytesInBuffer + bytesRead;
-
-							// look for CRLF | RFC 2616
-							int linePosition;
-							do {
-								linePosition = Array.IndexOf(buffer, (byte)'\n', bytesIndex, bytesBuffered - bytesIndex);
-								if (linePosition >= 0) {
-									if (linePosition == 0 || buffer[linePosition - 1] != (byte)'\r') {
-										bytesIndex = linePosition + 1;
-									}
-									else {
-										var count = linePosition - bytesConsumed - 1;
-										if (count > 0) {
-											var line = Encoding.UTF8.GetString(buffer, bytesConsumed, count);
-											responseHeaders.Add(line);
-											bytesConsumed = linePosition + 1;
-										}
-										else {
-											bytesConsumed = linePosition + 1;
-											bytesIndex = bytesConsumed;
-											isEnd = true;
-											break;
-										}
-										bytesIndex = linePosition + 1;
-									}
-								}
-							}
-							while (linePosition >= 0);
-						}
-
-						if (unexpectedClose) {
-							ArrayPool<byte>.Shared.Return(buffer2);
-							ArrayPool<byte>.Shared.Return(buffer);
-							socket.Close();
-							return;
-						}
-
-						if (responseHeaders.Count == 0 || !isEnd) {
-							ArrayPool<byte>.Shared.Return(buffer2);
-							ArrayPool<byte>.Shared.Return(buffer);
-							LogWarning("Unexpected response from server");
-							socket.Close();
-							return;
-						}
-
-						for (i = 0; i < responseHeaders.Count; i++) {
-							var line = responseHeaders[i];
-							if (line.StartsWith("Content-Length: ", StringComparison.Ordinal)) {
-								if (!long.TryParse(line.Substring("Content-Length: ".Length), NumberStyles.None, CultureInfo.InvariantCulture, out contentLength)) {
-									ArrayPool<byte>.Shared.Return(buffer);
-									LogWarning($"Failed to parse content length '{line}'");
-									socket.Close();
+								var status3 = await ReadBodyData(targetStream, sourceStream, responseState, isResponseChunked, responseContentLength);
+								if (status3.status != ReadDataStatus.Completed) {
+									LogResponseStatus(status3, requestState, requestContentLength);
 									return;
 								}
 							}
-							else if (string.Equals("Transfer-Encoding: chunked", line, StringComparison.OrdinalIgnoreCase)) {
-								isChunked = true;
+							else {
+								await WriteHeaders(requestHeaders, targetStream);
+
+								var status2 = await ReadBodyData(sourceStream, targetStream, requestState, isRequestChunked, requestContentLength);
+								if (status2.status != ReadDataStatus.Completed) {
+									LogRequestStatus(status2, requestState, requestContentLength);
+									return;
+								}
+
+								status = await ReadHeaderData(targetStream, responseState, responseHeaders);
+								if (status != ReadDataStatus.Completed) {
+									LogResponseStatus(status);
+									return;
+								}
+
+								if (!ProcessResponseHeaders(responseHeaders, certificate != null, originalHost, out var isResponseChunked, out responseContentLength)) {
+									return;
+								}
+
+								await WriteHeaders(responseHeaders, sourceStream);
+
+								status2 = await ReadBodyData(targetStream, sourceStream, responseState, isResponseChunked, responseContentLength);
+								if (status2.status != ReadDataStatus.Completed) {
+									LogResponseStatus(status2, requestState, requestContentLength);
+									return;
+								}
 							}
-							// rewrite redirects
-							//else if (line.StartsWith("Location: ", StringComparison.Ordinal)) {
-							//	var target = line.Substring(10).TrimEnd('/');
-							//	IProxyConfiguration proxy2 = null;
-							//	foreach (var s in _settings.Proxy) {
-							//		if (target.StartsWith(s.Target, StringComparison.OrdinalIgnoreCase) && (s.Target.Length == target.Length || target[s.Target.Length] == '/')) {
-							//			proxy2 = s;
-							//			break;
-							//		}
-							//	}
-							//	if (proxy2 != null) {
-							//		responseHeaders[i] = "Location: " + CommonUtility.CombineWithSlash((certificate != null ? Uri.UriSchemeHttps : Uri.UriSchemeHttp) + "://" + originalHost, proxy2.Path, target.Substring(proxy2.Target.Length));
-							//	}
-							//}
+
+							if (targetSslStream != null) {
+								await targetSslStream.DisposeAsync();
+							}
 						}
+					}
 
-						// write headers
-						foreach (var header in responseHeaders) {
-							var b = Encoding.UTF8.GetByteCount(header) + 2;
-							if (b > buffer2.Length) {
-								ArrayPool<byte>.Shared.Return(buffer2);
-								buffer2 = ArrayPool<byte>.Shared.Rent(b);
-							}
-							int l = Encoding.UTF8.GetBytes(header, buffer2);
-							buffer2[l] = (byte)'\r';
-							buffer2[l + 1] = (byte)'\n';
-							await sourceStream.WriteAsync(buffer2, 0, l + 2);
+					if (sourceSslStream != null) {
+						await sourceSslStream.DisposeAsync();
+					}
+				}
+				LogInformation("Request completed");
+			}
+			finally {
+				if (responseState.buffer != null) {
+					ArrayPool<byte>.Shared.Return(responseState.buffer);
+				}
+				if (requestState.buffer != null) {
+					ArrayPool<byte>.Shared.Return(requestState.buffer);
+				}
+				socket.Dispose();
+			}
+		}
+
+		private static bool ProcessRequestHeaders(List<string> requestHeaders, Uri targetUri, out string originalHost, out bool isContinue, out bool isRequestChunked, out long requestContentLength) {
+			originalHost = null;
+			requestContentLength = 0;
+			isContinue = isRequestChunked = false;
+			for (int i = 0; i < requestHeaders.Count; i++) {
+				var line = requestHeaders[i];
+				if (string.Equals("Expect: 100-continue", line, StringComparison.Ordinal)) {
+					isContinue = true;
+				}
+				else if (line.StartsWith("Content-Length: ", StringComparison.Ordinal)) {
+					if (!long.TryParse(line.Substring("Content-Length: ".Length), NumberStyles.None, CultureInfo.InvariantCulture, out requestContentLength)) {
+						LogWarning($"Failed to parse content length '{line}'");
+						return false;
+					}
+				}
+				else if (string.Equals("Transfer-Encoding: chunked", line, StringComparison.OrdinalIgnoreCase)) {
+					isRequestChunked = true;
+				}
+				else if (line.StartsWith("Host: ", StringComparison.Ordinal)) {
+					originalHost = line.Substring(6);
+					requestHeaders[i] = "Host: " + targetUri.Host + (targetUri.IsDefaultPort ? string.Empty : ":" + targetUri.Port.ToString(CultureInfo.InvariantCulture));
+				}
+			}
+			return true;
+		}
+
+		private static bool ProcessResponseHeaders(List<string> responseHeaders, bool isHttps, string originalHost, out bool isResponseChunked, out long responseContentLength) {
+			responseContentLength = 0;
+			isResponseChunked = false;
+			for (int i = 0; i < responseHeaders.Count; i++) {
+				var line = responseHeaders[i];
+				if (line.StartsWith("Content-Length: ", StringComparison.Ordinal)) {
+					if (!long.TryParse(line.Substring("Content-Length: ".Length), NumberStyles.None, CultureInfo.InvariantCulture, out responseContentLength)) {
+						LogWarning($"Failed to parse content length '{line}'");
+						return false;
+					}
+				}
+				else if (string.Equals("Transfer-Encoding: chunked", line, StringComparison.OrdinalIgnoreCase)) {
+					isResponseChunked = true;
+				}
+				// rewrite redirects
+				else if (line.StartsWith("Location: ", StringComparison.Ordinal)) {
+					var target = line.Substring(10).TrimEnd('/');
+					IProxyConfiguration proxy2 = null;
+					foreach (var s in _settings.Proxy) {
+						if (target.StartsWith(s.Target, StringComparison.OrdinalIgnoreCase) && (s.Target.Length == target.Length || target[s.Target.Length] == '/')) {
+							proxy2 = s;
+							break;
 						}
-						buffer2[0] = (byte)'\r';
-						buffer2[1] = (byte)'\n';
-						await sourceStream.WriteAsync(buffer2, 0, 2);
+					}
+					if (proxy2 != null) {
+						responseHeaders[i] = "Location: " + CommonUtility.CombineWithSlash((isHttps ? Uri.UriSchemeHttps : Uri.UriSchemeHttp) + "://" + originalHost, proxy2.Path, target.Substring(proxy2.Target.Length));
+					}
+				}
+			}
+			return true;
+		}
 
-						ArrayPool<byte>.Shared.Return(buffer2);
+		private sealed class ReadState {
+			public int bytesBuffered;
+			public int bytesConsumed;
+			public int bytesIndex;
+			public byte[] buffer;
+			public long bodyLength;
+		}
 
-						if (isChunked) {
-							// write remaining data
-							if (bytesBuffered - bytesConsumed > 0) {
-								responseLength += (bytesBuffered - bytesConsumed);
-								await sourceStream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
-							}
+		private enum ReadDataStatus {
+			Completed,
+			ConnectionClosed,
+			UnexpectedData,
+			InvalidChunkSize,
+			InvalidChunkEnd,
+			MoreDataExpected,
+			MoreDataReceivedThanExpected,
+			UnexpectedBodyLength
+		}
 
-							int chunkCount = 0;
-							long chunkSize = 0, chunkLength = 0;
-							bool isStart = true, getMoreData = true;
-							isEnd = false;
-							bytesIndex = bytesConsumed;
-							do {
-								if (isStart) {
-									getMoreData = true;
-									// look for CRLF
-									int linePosition;
-									do {
-										linePosition = Array.IndexOf(buffer, (byte)'\n', bytesIndex, bytesBuffered - bytesIndex);
-										if (linePosition >= 0) {
-											if (linePosition == 0 || buffer[linePosition - 1] != (byte)'\r') {
-												bytesIndex = linePosition + 1;
-											}
-											else {
-												var line = Encoding.UTF8.GetString(buffer, bytesConsumed, linePosition - bytesConsumed - 1);
-												bytesConsumed = linePosition + 1;
-												bytesIndex = bytesConsumed;
-												isStart = false;
-												if (line.Length == 0 || !long.TryParse(line, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out chunkSize) || chunkSize < 0) {
-													LogWarning($"Unexpected chunk size {line}");
-													ArrayPool<byte>.Shared.Return(buffer);
-													socket.Close();
-													return;
-												}
-												getMoreData = false;
-												break;
-											}
-										}
-									}
-									while (linePosition >= 0);
-								}
-								else if (isEnd) {
-									getMoreData = true;
-									var bytesInBuffer = bytesBuffered - bytesConsumed;
-									if (bytesInBuffer > 1) {
-										if (buffer[bytesConsumed] != (byte)'\r' || buffer[bytesConsumed + 1] != (byte)'\n') {
-											LogWarning($"Unexpected chunk end {buffer[bytesConsumed]:x2} {buffer[bytesConsumed + 1]:x2}");
-											ArrayPool<byte>.Shared.Return(buffer);
-											socket.Close();
-											return;
-										}
-										chunkCount++;
-										if (chunkSize == 0) {
-											bytesConsumed += 2;
-											bytesIndex = bytesConsumed;
-											getMoreData = false;
-											break;
-										}
-										isEnd = false;
-										isStart = true;
-										bytesConsumed += 2;
-										bytesIndex = bytesConsumed;
-										responseLength += chunkSize;
-										chunkLength = 0;
-										chunkSize = 0;
-										getMoreData = false;
-									}
-								}
-								else {
-									var remaining = chunkSize - chunkLength;
-									var nextBlock = bytesBuffered - bytesConsumed;
-									if (nextBlock > remaining) {
-										nextBlock = (int)remaining;
-									}
-									bytesConsumed += nextBlock;
-									bytesIndex = bytesConsumed;
-									chunkLength += nextBlock;
-									isEnd = chunkLength == chunkSize;
-									getMoreData = !isEnd;
-								}
+		private static async Task<ReadDataStatus> ReadHeaderData(Stream stream, ReadState readState, List<string> headers) {
+			bool isEnd = false;
+			while (!isEnd /*&& stream.DataAvailable*/) {
+				var bytesInBuffer = readState.bytesBuffered - readState.bytesConsumed;
+				if (bytesInBuffer > (readState.buffer.Length / 2)) {
+					// expand buffer
+					var newBuffer = ArrayPool<byte>.Shared.Rent((readState.buffer.Length < (int.MaxValue / 2)) ? readState.buffer.Length * 2 : int.MaxValue);
+					// copy the unprocessed data
+					Buffer.BlockCopy(readState.buffer, readState.bytesConsumed, newBuffer, 0, bytesInBuffer);
+					ArrayPool<byte>.Shared.Return(readState.buffer);
+					readState.buffer = newBuffer;
+				}
+				else if (bytesInBuffer > 0) {
+					Buffer.BlockCopy(readState.buffer, readState.bytesConsumed, readState.buffer, 0, bytesInBuffer);
+				}
+				readState.bytesIndex -= readState.bytesConsumed;
+				readState.bytesConsumed = 0;
 
-								if (getMoreData) {
-									var bytesInBuffer = bytesBuffered - bytesConsumed;
-									if (bytesInBuffer > (buffer.Length / 2)) {
-										// expand buffer
-										var newBuffer = ArrayPool<byte>.Shared.Rent((buffer.Length < (int.MaxValue / 2)) ? buffer.Length * 2 : int.MaxValue);
-										// copy the unprocessed data
-										Buffer.BlockCopy(buffer, bytesConsumed, newBuffer, 0, bytesInBuffer);
-										ArrayPool<byte>.Shared.Return(buffer);
-										buffer = newBuffer;
-									}
-									else if (bytesInBuffer > 0) {
-										Buffer.BlockCopy(buffer, bytesConsumed, buffer, 0, bytesInBuffer);
-									}
-									bytesIndex -= bytesConsumed;
-									bytesConsumed = 0;
+				var bytesRead = await stream.ReadAsync(readState.buffer, bytesInBuffer, readState.buffer.Length - bytesInBuffer);
+				if (bytesRead == 0) {
+					return ReadDataStatus.ConnectionClosed;
+				}
 
-									var bytesRead = await targetStream.ReadAsync(buffer, bytesInBuffer, buffer.Length - bytesInBuffer);
-									if (bytesRead == 0) {
-										LogWarning("Server closed the connection");
-										unexpectedClose = true;
-										break;
-									}
-									bytesBuffered = bytesInBuffer + bytesRead;
-									await sourceStream.WriteAsync(buffer, bytesInBuffer, bytesRead);
-								}
-							}
-							while (true);
+				readState.bytesBuffered = bytesInBuffer + bytesRead;
 
-							if (unexpectedClose) {
-								ArrayPool<byte>.Shared.Return(buffer);
-								socket.Close();
-								return;
-							}
-
-							if (!isEnd || getMoreData) {
-								ArrayPool<byte>.Shared.Return(buffer);
-								LogWarning("Unexpected response from server");
-								socket.Close();
-								return;
-							}
-
-							if (bytesBuffered - bytesConsumed > 0) {
-								ArrayPool<byte>.Shared.Return(buffer);
-								LogWarning("Unexpected response from server");
-								socket.Close();
-								return;
-							}
+				// look for CRLF | RFC 2616
+				int linePosition;
+				do {
+					linePosition = Array.IndexOf(readState.buffer, (byte)'\n', readState.bytesIndex, readState.bytesBuffered - readState.bytesIndex);
+					if (linePosition >= 0) {
+						if (linePosition == 0 || readState.buffer[linePosition - 1] != (byte)'\r') {
+							readState.bytesIndex = linePosition + 1;
 						}
 						else {
-							// write remaining data
-							if (bytesBuffered - bytesConsumed > 0) {
-								responseLength += (bytesBuffered - bytesConsumed);
-								await sourceStream.WriteAsync(buffer, bytesConsumed, bytesBuffered - bytesConsumed);
+							var count = linePosition - readState.bytesConsumed - 1;
+							if (count > 0) {
+								var line = Encoding.UTF8.GetString(readState.buffer, readState.bytesConsumed, count);
+								headers.Add(line);
+								readState.bytesConsumed = linePosition + 1;
 							}
-
-							// read remaining data
-							while (responseLength < contentLength) {
-								var bytesRead = await targetStream.ReadAsync(buffer);
-								if (bytesRead == 0) {
-									break;
-								}
-
-								responseLength += bytesRead;
-								await sourceStream.WriteAsync(buffer, 0, bytesRead);
+							else {
+								readState.bytesConsumed = linePosition + 1;
+								readState.bytesIndex = readState.bytesConsumed;
+								isEnd = true;
+								break;
 							}
-
-							if (contentLength != responseLength) {
-								LogWarning($"Unexpected response length {responseLength} expected {contentLength}");
-							}
-						}
-
-						if (targetSslStream != null) {
-							await targetSslStream.DisposeAsync();
+							readState.bytesIndex = linePosition + 1;
 						}
 					}
 				}
+				while (linePosition >= 0);
+			}
 
-				ArrayPool<byte>.Shared.Return(buffer);
+			if (headers.Count == 0 || !isEnd) {
+				return ReadDataStatus.UnexpectedData;
+			}
 
-				if (sourceSslStream != null) {
-					await sourceSslStream.DisposeAsync();
+			return ReadDataStatus.Completed;
+		}
+
+		private static async Task<(ReadDataStatus status, string data)> ReadBodyData(Stream sourceStream, Stream targetStream, ReadState readState, bool isChunked, long contentLength) {
+			bool isEnd = false;
+			if (isChunked) {
+				// write remaining data
+				if (readState.bytesBuffered - readState.bytesConsumed > 0) {
+					readState.bodyLength += (readState.bytesBuffered - readState.bytesConsumed);
+					await targetStream.WriteAsync(readState.buffer, readState.bytesConsumed, readState.bytesBuffered - readState.bytesConsumed);
 				}
 
-				socket.Close();
+				int chunkCount = 0;
+				long chunkSize = 0, chunkLength = 0;
+				bool isStart = true, getMoreData = true;
+				readState.bytesIndex = readState.bytesConsumed;
+				do {
+					if (isStart) {
+						getMoreData = true;
+						// look for CRLF
+						int linePosition;
+						do {
+							linePosition = Array.IndexOf(readState.buffer, (byte)'\n', readState.bytesIndex, readState.bytesBuffered - readState.bytesIndex);
+							if (linePosition >= 0) {
+								if (linePosition == 0 || readState.buffer[linePosition - 1] != (byte)'\r') {
+									readState.bytesIndex = linePosition + 1;
+								}
+								else {
+									var line = Encoding.UTF8.GetString(readState.buffer, readState.bytesConsumed, linePosition - readState.bytesConsumed - 1);
+									readState.bytesConsumed = linePosition + 1;
+									readState.bytesIndex = readState.bytesConsumed;
+									isStart = false;
+									if (line.Length == 0 || !long.TryParse(line, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out chunkSize) || chunkSize < 0) {
+										return (ReadDataStatus.InvalidChunkSize, line);
+									}
+									getMoreData = false;
+									break;
+								}
+							}
+						}
+						while (linePosition >= 0);
+					}
+					else if (isEnd) {
+						getMoreData = true;
+						var bytesInBuffer = readState.bytesBuffered - readState.bytesConsumed;
+						if (bytesInBuffer > 1) {
+							if (readState.buffer[readState.bytesConsumed] != (byte)'\r' || readState.buffer[readState.bytesConsumed + 1] != (byte)'\n') {
+								return (ReadDataStatus.InvalidChunkEnd, $"{readState.buffer[readState.bytesConsumed]:x2}{readState.buffer[readState.bytesConsumed + 1]:x2}");
+							}
+							chunkCount++;
+							if (chunkSize == 0) {
+								readState.bytesConsumed += 2;
+								readState.bytesIndex = readState.bytesConsumed;
+								getMoreData = false;
+								break;
+							}
+							isEnd = false;
+							isStart = true;
+							readState.bytesConsumed += 2;
+							readState.bytesIndex = readState.bytesConsumed;
+							readState.bodyLength += chunkSize;
+							chunkLength = 0;
+							chunkSize = 0;
+							getMoreData = false;
+						}
+					}
+					else {
+						var remaining = chunkSize - chunkLength;
+						var nextBlock = readState.bytesBuffered - readState.bytesConsumed;
+						if (nextBlock > remaining) {
+							nextBlock = (int)remaining;
+						}
+						readState.bytesConsumed += nextBlock;
+						readState.bytesIndex = readState.bytesConsumed;
+						chunkLength += nextBlock;
+						isEnd = chunkLength == chunkSize;
+						getMoreData = !isEnd;
+					}
+
+					if (getMoreData) {
+						var bytesInBuffer = readState.bytesBuffered - readState.bytesConsumed;
+						if (bytesInBuffer > (readState.buffer.Length / 2)) {
+							// expand buffer
+							var newBuffer = ArrayPool<byte>.Shared.Rent((readState.buffer.Length < (int.MaxValue / 2)) ? readState.buffer.Length * 2 : int.MaxValue);
+							// copy the unprocessed data
+							Buffer.BlockCopy(readState.buffer, readState.bytesConsumed, newBuffer, 0, bytesInBuffer);
+							ArrayPool<byte>.Shared.Return(readState.buffer);
+							readState.buffer = newBuffer;
+						}
+						else if (bytesInBuffer > 0) {
+							Buffer.BlockCopy(readState.buffer, readState.bytesConsumed, readState.buffer, 0, bytesInBuffer);
+						}
+						readState.bytesIndex -= readState.bytesConsumed;
+						readState.bytesConsumed = 0;
+
+						var bytesRead = await sourceStream.ReadAsync(readState.buffer, bytesInBuffer, readState.buffer.Length - bytesInBuffer);
+						if (bytesRead == 0) {
+							return (ReadDataStatus.ConnectionClosed, null);
+						}
+						readState.bytesBuffered = bytesInBuffer + bytesRead;
+						await targetStream.WriteAsync(readState.buffer, bytesInBuffer, bytesRead);
+					}
+				}
+				while (true);
+
+				if (!isEnd || getMoreData) {
+					return (ReadDataStatus.MoreDataExpected, null);
+				}
+
+				if (readState.bytesBuffered - readState.bytesConsumed > 0) {
+					return (ReadDataStatus.MoreDataReceivedThanExpected, null);
+				}
 			}
-			LogInformation("Request completed");
+			else {
+				// write remaining data
+				if (readState.bytesBuffered - readState.bytesConsumed > 0) {
+					readState.bodyLength += (readState.bytesBuffered - readState.bytesConsumed);
+					await targetStream.WriteAsync(readState.buffer, readState.bytesConsumed, readState.bytesBuffered - readState.bytesConsumed);
+				}
+
+				// read remaining data
+				while (readState.bodyLength < contentLength) {
+					var bytesRead = await sourceStream.ReadAsync(readState.buffer);
+					if (bytesRead == 0) {
+						break;
+					}
+
+					readState.bodyLength += bytesRead;
+					await targetStream.WriteAsync(readState.buffer, 0, bytesRead);
+				}
+
+				if (readState.bodyLength != contentLength) {
+					return (ReadDataStatus.UnexpectedBodyLength, null);
+				}
+			}
+			return (ReadDataStatus.Completed, null);
+		}
+
+		private static async Task WriteHeaders(List<string> headers, Stream stream) {
+			var buffer = ArrayPool<byte>.Shared.Rent(1024);
+			try {
+				foreach (var header in headers) {
+					var b = Encoding.UTF8.GetByteCount(header) + 2;
+					if (b > buffer.Length) {
+						ArrayPool<byte>.Shared.Return(buffer);
+						buffer = ArrayPool<byte>.Shared.Rent(b);
+					}
+					int l = Encoding.UTF8.GetBytes(header, buffer);
+					buffer[l] = (byte)'\r';
+					buffer[l + 1] = (byte)'\n';
+					await stream.WriteAsync(buffer, 0, l + 2);
+				}
+				buffer[0] = (byte)'\r';
+				buffer[1] = (byte)'\n';
+				await stream.WriteAsync(buffer, 0, 2);
+			}
+			finally {
+				ArrayPool<byte>.Shared.Return(buffer);
+			}
+		}
+
+		private static void LogRequestStatus(ReadDataStatus status) {
+			if (status == ReadDataStatus.ConnectionClosed) {
+				LogWarning("Client closed the connection");
+			}
+			else if (status == ReadDataStatus.UnexpectedData) {
+				LogWarning("Unexpected data received from client");
+			}
+			else {
+				throw new NotImplementedException(status.ToString());
+			}
+		}
+
+		private static void LogRequestStatus((ReadDataStatus status, string data) status, ReadState readState, long contentLength) {
+			if (status.status == ReadDataStatus.ConnectionClosed) {
+				LogWarning("Client closed the connection");
+			}
+			else if (status.status == ReadDataStatus.InvalidChunkSize) {
+				LogWarning($"Unexpected chunk size '{status.data}' received from client");
+			}
+			else if (status.status == ReadDataStatus.InvalidChunkEnd) {
+				LogWarning($"Unexpected chunk end '{status.data}' received from client");
+			}
+			else if (status.status == ReadDataStatus.MoreDataExpected) {
+				LogWarning($"Expected more data from client");
+			}
+			else if (status.status == ReadDataStatus.MoreDataReceivedThanExpected) {
+				LogWarning($"More data received from client than expected");
+			}
+			else if (status.status == ReadDataStatus.UnexpectedBodyLength) {
+				LogWarning($"Unexpected request length {readState.bodyLength} expected {contentLength}");
+			}
+			else {
+				throw new NotImplementedException(status.ToString());
+			}
+		}
+
+		private static void LogResponseStatus(ReadDataStatus status) {
+			if (status == ReadDataStatus.ConnectionClosed) {
+				LogWarning("Server closed the connection");
+			}
+			else if (status == ReadDataStatus.UnexpectedData) {
+				LogWarning("Unexpected data received from server");
+			}
+			else {
+				throw new NotImplementedException(status.ToString());
+			}
+		}
+
+		private static void LogResponseStatus((ReadDataStatus status, string data) status, ReadState readState, long contentLength) {
+			if (status.status == ReadDataStatus.ConnectionClosed) {
+				LogWarning("Server closed the connection");
+			}
+			else if (status.status == ReadDataStatus.InvalidChunkSize) {
+				LogWarning($"Unexpected chunk size '{status.data}' received from server");
+			}
+			else if (status.status == ReadDataStatus.InvalidChunkEnd) {
+				LogWarning($"Unexpected chunk end '{status.data}' received from server");
+			}
+			else if (status.status == ReadDataStatus.MoreDataExpected) {
+				LogWarning($"Expected more data from server");
+			}
+			else if (status.status == ReadDataStatus.MoreDataReceivedThanExpected) {
+				LogWarning($"More data received from server than expected");
+			}
+			else if (status.status == ReadDataStatus.UnexpectedBodyLength) {
+				LogWarning($"Unexpected response length {readState.bodyLength} expected {contentLength}");
+			}
+			else {
+				throw new NotImplementedException(status.ToString());
+			}
 		}
 
 		private static IFarmSettings GetFarSettings(IConfiguration config) {
