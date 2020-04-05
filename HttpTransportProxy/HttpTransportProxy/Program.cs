@@ -111,9 +111,9 @@ namespace HttpTransportProxy {
 			ReadState requestState = new ReadState();
 			ReadState responseState = new ReadState();
 			try {
+				SslStream sourceSslStream = null;
 				using (var clientStream = new NetworkStream(socket, FileAccess.ReadWrite, false)) {
 					Stream sourceStream = clientStream;
-					SslStream sourceSslStream = null;
 					if (certificate != null) {
 						sourceStream = sourceSslStream = new SslStream(clientStream, true);
 						var protocols = SslProtocols.Tls12;
@@ -202,9 +202,9 @@ namespace HttpTransportProxy {
 					using (var remoteSocket = new Socket(SocketType.Stream, ProtocolType.Tcp)) {
 						await remoteSocket.ConnectAsync(serverIps, connectPort);
 
+						SslStream targetSslStream = null;
 						using (var remoteStream = new NetworkStream(remoteSocket, FileAccess.ReadWrite, false)) {
 							Stream targetStream = remoteStream;
-							SslStream targetSslStream = null;
 							if (targetUri.Scheme == Uri.UriSchemeHttps) {
 								targetStream = targetSslStream = new SslStream(remoteStream, true);
 								var protocols = SslProtocols.Tls12;
@@ -321,16 +321,19 @@ namespace HttpTransportProxy {
 								}
 							}
 
-							if (targetSslStream != null) {
-								await targetSslStream.DisposeAsync();
-							}
+							remoteSocket.Shutdown(SocketShutdown.Both);
+						}
+						if (targetSslStream != null) {
+							await targetSslStream.DisposeAsync();
 						}
 					}
 
-					if (sourceSslStream != null) {
-						await sourceSslStream.DisposeAsync();
-					}
+					socket.Shutdown(SocketShutdown.Both);
 				}
+				if (sourceSslStream != null) {
+					await sourceSslStream.DisposeAsync();
+				}
+
 				LogInformation("Request completed");
 			}
 			finally {
