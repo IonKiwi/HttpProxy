@@ -192,6 +192,9 @@ namespace HttpTransportProxy {
 					return;
 				}
 
+				var path = CommonUtility.CombineWithSlash("/", destination.Substring(proxy.Path.Length));
+				headers[0] = verb + " " + path + headers[0].Substring(i2);
+
 				var targetUri = new Uri(proxy.Target, UriKind.Absolute);
 				bool isContinue = false, isChunked = false;
 				long contentLength = 0;
