@@ -29,7 +29,7 @@ namespace HttpTransportProxy {
 		static async Task Main(string[] args) {
 			IConfiguration config = GetConfiguration();
 			_isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
-			_settings = GetFarSettings(config);
+			_settings = await GetFarSettings(config);
 
 			Func<Task> acceptAction = Accept;
 			_ = Task.Run(acceptAction);
@@ -110,9 +110,10 @@ namespace HttpTransportProxy {
 			long requestContentLength = 0, responseContentLength = 0;
 			ReadState requestState = new ReadState();
 			ReadState responseState = new ReadState();
+			Dictionary<string, (Socket socket, NetworkStream stream, SslStream sslStream)> serverConnections = new Dictionary<string, (Socket socket, NetworkStream stream, SslStream sslStream)>(StringComparer.Ordinal);
+			SslStream sourceSslStream = null;
 			try {
-				SslStream sourceSslStream = null;
-				using (var clientStream = new NetworkStream(socket, FileAccess.ReadWrite, false)) {
+				await using (var clientStream = new NetworkStream(socket, FileAccess.ReadWrite, false)) {
 					Stream sourceStream = clientStream;
 					if (certificate != null) {
 						sourceStream = sourceSslStream = new SslStream(clientStream, true);
@@ -146,6 +147,13 @@ namespace HttpTransportProxy {
 					requestState.bytesBuffered = 0;
 					requestState.bytesConsumed = 0;
 					requestState.bytesIndex = 0;
+
+					responseState.buffer = ArrayPool<byte>.Shared.Rent(1024);
+					responseState.bytesBuffered = 0;
+					responseState.bytesConsumed = 0;
+					responseState.bytesIndex = 0;
+
+				start:
 
 					var status = await ReadHeaderData(sourceStream, requestState, requestHeaders);
 					if (status != ReadDataStatus.Completed) {
@@ -186,162 +194,169 @@ namespace HttpTransportProxy {
 					requestHeaders[0] = verb + " " + path + requestHeaders[0].Substring(i2);
 
 					var targetUri = new Uri(proxy.Target, UriKind.Absolute);
-					bool isContinue, isRequestChunked;
+					bool isContinue, keepAlive, isRequestChunked;
 					string originalHost;
 					// process request headers
-					if (!ProcessRequestHeaders(requestHeaders, targetUri, out originalHost, out isContinue, out isRequestChunked, out requestContentLength)) {
+					if (!ProcessRequestHeaders(requestHeaders, targetUri, out originalHost, out isContinue, out keepAlive, out isRequestChunked, out requestContentLength)) {
 						return;
 					}
 
-					IPAddress[] serverIps = Dns.GetHostAddresses(targetUri.DnsSafeHost);
-					if (serverIps == null || serverIps.Length == 0) {
-						LogWarning($"Failed to resolve addresses of {proxy.Target}");
-						return;
-					}
-					int connectPort = targetUri.Port;
-					using (var remoteSocket = new Socket(SocketType.Stream, ProtocolType.Tcp)) {
+					if (!serverConnections.TryGetValue(proxy.Target, out var serverConnection)) {
+						IPAddress[] serverIps = Dns.GetHostAddresses(targetUri.DnsSafeHost);
+						if (serverIps == null || serverIps.Length == 0) {
+							LogWarning($"Failed to resolve addresses of {proxy.Target}");
+							return;
+						}
+						int connectPort = targetUri.Port;
+						var remoteSocket = new Socket(SocketType.Stream, ProtocolType.Tcp);
 						await remoteSocket.ConnectAsync(serverIps, connectPort);
 
 						SslStream targetSslStream = null;
-						using (var remoteStream = new NetworkStream(remoteSocket, FileAccess.ReadWrite, false)) {
-							Stream targetStream = remoteStream;
-							if (targetUri.Scheme == Uri.UriSchemeHttps) {
-								targetStream = targetSslStream = new SslStream(remoteStream, true);
-								var protocols = SslProtocols.Tls12;
-								if (!_isWindows) {
-									protocols |= SslProtocols.Tls13;
-								}
-								//CipherSuitesPolicy policy = new CipherSuitesPolicy(new[] {
-								//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-								//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-								//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-								//	TlsCipherSuite.TLS_AES_128_GCM_SHA256,
-								//	TlsCipherSuite.TLS_AES_256_GCM_SHA384,
-								//	TlsCipherSuite.TLS_CHACHA20_POLY1305_SHA256,
-								//});
-								await targetSslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions() {
-									AllowRenegotiation = false,
-									ApplicationProtocols = new List<SslApplicationProtocol>() {
+						var remoteStream = new NetworkStream(remoteSocket, FileAccess.ReadWrite, false);
+						if (targetUri.Scheme == Uri.UriSchemeHttps) {
+							var protocols = SslProtocols.Tls12;
+							if (!_isWindows) {
+								protocols |= SslProtocols.Tls13;
+							}
+							//CipherSuitesPolicy policy = new CipherSuitesPolicy(new[] {
+							//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+							//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+							//	TlsCipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+							//	TlsCipherSuite.TLS_AES_128_GCM_SHA256,
+							//	TlsCipherSuite.TLS_AES_256_GCM_SHA384,
+							//	TlsCipherSuite.TLS_CHACHA20_POLY1305_SHA256,
+							//});
+							await targetSslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions() {
+								AllowRenegotiation = false,
+								ApplicationProtocols = new List<SslApplicationProtocol>() {
 									SslApplicationProtocol.Http11,
 									//SslApplicationProtocol.Http2
 								},
-									CertificateRevocationCheckMode = X509RevocationMode.Online,
-									//CipherSuitesPolicy = policy,
-									EnabledSslProtocols = protocols,
-									EncryptionPolicy = EncryptionPolicy.RequireEncryption,
-									TargetHost = targetUri.Host,
-									RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => ValidateServerCertificate(certificate, chain, sslPolicyErrors, proxy)
-								});
-							}
-
-							responseState.buffer = ArrayPool<byte>.Shared.Rent(1024);
-							responseState.bytesBuffered = 0;
-							responseState.bytesConsumed = 0;
-							responseState.bytesIndex = 0;
-
-							if (isContinue) {
-								await WriteHeaders(requestHeaders, targetStream);
-
-								status = await ReadHeaderData(targetStream, responseState, responseHeaders);
-								if (status != ReadDataStatus.Completed) {
-									LogResponseStatus(status);
-									return;
-								}
-
-								bool isServerContinue = false;
-								if (string.Equals(responseHeaders[0], "HTTP/1.1 100 Continue", StringComparison.Ordinal)) {
-									isServerContinue = true;
-								}
-								//else if (string.Equals(responseHeaders[0], "HTTP/1.1 417 Expectation Failed", StringComparison.Ordinal)) {
-								//	isServerContinue = false;
-								//}
-
-								bool isResponseChunked;
-								if (isServerContinue) {
-									await WriteHeaders(responseHeaders, sourceStream);
-
-									var status2 = await ReadBodyData(sourceStream, targetStream, requestState, isRequestChunked, requestContentLength);
-									if (status2.status != ReadDataStatus.Completed) {
-										LogRequestStatus(status2, requestState, requestContentLength);
-										return;
-									}
-
-									responseHeaders.Clear();
-									status = await ReadHeaderData(targetStream, responseState, responseHeaders);
-									if (status != ReadDataStatus.Completed) {
-										LogResponseStatus(status);
-										return;
-									}
-
-									if (!ProcessResponseHeaders(responseHeaders, certificate != null, originalHost, out isResponseChunked, out responseContentLength)) {
-										return;
-									}
-
-									await WriteHeaders(responseHeaders, sourceStream);
-								}
-								else {
-									if (!ProcessResponseHeaders(responseHeaders, certificate != null, originalHost, out isResponseChunked, out responseContentLength)) {
-										return;
-									}
-
-									await WriteHeaders(responseHeaders, sourceStream);
-								}
-
-								var status3 = await ReadBodyData(targetStream, sourceStream, responseState, isResponseChunked, responseContentLength);
-								if (status3.status != ReadDataStatus.Completed) {
-									LogResponseStatus(status3, requestState, requestContentLength);
-									return;
-								}
-							}
-							else {
-								await WriteHeaders(requestHeaders, targetStream);
-
-								var status2 = await ReadBodyData(sourceStream, targetStream, requestState, isRequestChunked, requestContentLength);
-								if (status2.status != ReadDataStatus.Completed) {
-									LogRequestStatus(status2, requestState, requestContentLength);
-									return;
-								}
-
-								status = await ReadHeaderData(targetStream, responseState, responseHeaders);
-								if (status != ReadDataStatus.Completed) {
-									LogResponseStatus(status);
-									return;
-								}
-
-								if (!ProcessResponseHeaders(responseHeaders, certificate != null, originalHost, out var isResponseChunked, out responseContentLength)) {
-									return;
-								}
-
-								await WriteHeaders(responseHeaders, sourceStream);
-
-								status2 = await ReadBodyData(targetStream, sourceStream, responseState, isResponseChunked, responseContentLength);
-								if (status2.status != ReadDataStatus.Completed) {
-									LogResponseStatus(status2, requestState, requestContentLength);
-									return;
-								}
-							}
-
-							remoteSocket.Shutdown(SocketShutdown.Both);
-
-							//requestState.bodyLength = 0;
-							//responseState.bodyLength = 0;
-							//requestHeaders.Clear();
-							//responseHeaders.Clear();
+								CertificateRevocationCheckMode = X509RevocationMode.Online,
+								//CipherSuitesPolicy = policy,
+								EnabledSslProtocols = protocols,
+								EncryptionPolicy = EncryptionPolicy.RequireEncryption,
+								TargetHost = targetUri.Host,
+								RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => ValidateServerCertificate(certificate, chain, sslPolicyErrors, proxy)
+							});
 						}
-						if (targetSslStream != null) {
-							await targetSslStream.DisposeAsync();
+						serverConnection = (remoteSocket, remoteStream, targetSslStream);
+						serverConnections.Add(proxy.Target, serverConnection);
+					}
+
+					Stream targetStream = serverConnection.stream;
+					if (serverConnection.sslStream != null) {
+						targetStream = serverConnection.sslStream;
+					}
+					if (isContinue) {
+						await WriteHeaders(requestHeaders, targetStream);
+
+						status = await ReadHeaderData(targetStream, responseState, responseHeaders);
+						if (status != ReadDataStatus.Completed) {
+							LogResponseStatus(status);
+							return;
+						}
+
+						bool isServerContinue = false;
+						if (string.Equals(responseHeaders[0], "HTTP/1.1 100 Continue", StringComparison.Ordinal)) {
+							isServerContinue = true;
+						}
+						//else if (string.Equals(responseHeaders[0], "HTTP/1.1 417 Expectation Failed", StringComparison.Ordinal)) {
+						//	isServerContinue = false;
+						//}
+
+						bool isResponseChunked;
+						if (isServerContinue) {
+							await WriteHeaders(responseHeaders, sourceStream);
+
+							var status2 = await ReadBodyData(sourceStream, targetStream, requestState, isRequestChunked, requestContentLength);
+							if (status2.status != ReadDataStatus.Completed) {
+								LogRequestStatus(status2, requestState, requestContentLength);
+								return;
+							}
+
+							responseHeaders.Clear();
+							status = await ReadHeaderData(targetStream, responseState, responseHeaders);
+							if (status != ReadDataStatus.Completed) {
+								LogResponseStatus(status);
+								return;
+							}
+
+							if (!ProcessResponseHeaders(responseHeaders, certificate != null, originalHost, out isResponseChunked, out responseContentLength)) {
+								return;
+							}
+
+							await WriteHeaders(responseHeaders, sourceStream);
+						}
+						else {
+							if (!ProcessResponseHeaders(responseHeaders, certificate != null, originalHost, out isResponseChunked, out responseContentLength)) {
+								return;
+							}
+
+							await WriteHeaders(responseHeaders, sourceStream);
+						}
+
+						var status3 = await ReadBodyData(targetStream, sourceStream, responseState, isResponseChunked, responseContentLength);
+						if (status3.status != ReadDataStatus.Completed) {
+							LogResponseStatus(status3, requestState, requestContentLength);
+							return;
+						}
+					}
+					else {
+						await WriteHeaders(requestHeaders, targetStream);
+
+						var status2 = await ReadBodyData(sourceStream, targetStream, requestState, isRequestChunked, requestContentLength);
+						if (status2.status != ReadDataStatus.Completed) {
+							LogRequestStatus(status2, requestState, requestContentLength);
+							return;
+						}
+
+						status = await ReadHeaderData(targetStream, responseState, responseHeaders);
+						if (status != ReadDataStatus.Completed) {
+							LogResponseStatus(status);
+							return;
+						}
+
+						if (!ProcessResponseHeaders(responseHeaders, certificate != null, originalHost, out var isResponseChunked, out responseContentLength)) {
+							return;
+						}
+
+						await WriteHeaders(responseHeaders, sourceStream);
+
+						status2 = await ReadBodyData(targetStream, sourceStream, responseState, isResponseChunked, responseContentLength);
+						if (status2.status != ReadDataStatus.Completed) {
+							LogResponseStatus(status2, requestState, requestContentLength);
+							return;
 						}
 					}
 
+					if (keepAlive) {
+						requestState.bodyLength = 0;
+						responseState.bodyLength = 0;
+						requestHeaders.Clear();
+						responseHeaders.Clear();
+						goto start;
+					}
+
 					socket.Shutdown(SocketShutdown.Both);
+
+					LogInformation("Request completed");
 				}
+			}
+			finally {
+
 				if (sourceSslStream != null) {
 					await sourceSslStream.DisposeAsync();
 				}
 
-				LogInformation("Request completed");
-			}
-			finally {
+				foreach (var kv in serverConnections) {
+					kv.Value.socket.Shutdown(SocketShutdown.Both);
+					await kv.Value.stream.DisposeAsync();
+					if (kv.Value.sslStream != null) {
+						await kv.Value.sslStream.DisposeAsync();
+					}
+				}
+
 				if (responseState.buffer != null) {
 					ArrayPool<byte>.Shared.Return(responseState.buffer);
 				}
@@ -352,10 +367,10 @@ namespace HttpTransportProxy {
 			}
 		}
 
-		private static bool ProcessRequestHeaders(List<string> requestHeaders, Uri targetUri, out string originalHost, out bool isContinue, out bool isRequestChunked, out long requestContentLength) {
+		private static bool ProcessRequestHeaders(List<string> requestHeaders, Uri targetUri, out string originalHost, out bool isContinue, out bool keepAlive, out bool isRequestChunked, out long requestContentLength) {
 			originalHost = null;
 			requestContentLength = 0;
-			isContinue = isRequestChunked = false;
+			isContinue = keepAlive = isRequestChunked = false;
 			for (int i = 0; i < requestHeaders.Count; i++) {
 				var line = requestHeaders[i];
 				if (string.Equals("Expect: 100-continue", line, StringComparison.Ordinal)) {
@@ -373,6 +388,9 @@ namespace HttpTransportProxy {
 				else if (line.StartsWith("Host: ", StringComparison.Ordinal)) {
 					originalHost = line.Substring(6);
 					requestHeaders[i] = "Host: " + targetUri.Host + (targetUri.IsDefaultPort ? string.Empty : ":" + targetUri.Port.ToString(CultureInfo.InvariantCulture));
+				}
+				else if (string.Equals("Connection: keep-alive", line, StringComparison.Ordinal)) {
+					keepAlive = true;
 				}
 			}
 			return true;
@@ -724,14 +742,14 @@ namespace HttpTransportProxy {
 			}
 		}
 
-		private static IFarmSettings GetFarSettings(IConfiguration config) {
+		private static async Task<IFarmSettings> GetFarSettings(IConfiguration config) {
 			var appSettings = new FarmSettingsValues();
 			config.GetSection("FarmSettings").Bind(appSettings);
 
 			string json;
-			using (var file = File.Open(appSettings.ConfigPath + "\\HttpProxy.global.js", FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
+			await using (var file = File.Open(appSettings.ConfigPath + "\\HttpProxy.global.js", FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
 				using (var sr = new StreamReader(file, Encoding.UTF8, false)) {
-					json = sr.ReadToEnd();
+					json = await sr.ReadToEndAsync();
 				}
 			}
 
