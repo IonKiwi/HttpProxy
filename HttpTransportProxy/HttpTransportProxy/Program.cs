@@ -411,19 +411,19 @@ namespace HttpTransportProxy {
 					isResponseChunked = true;
 				}
 				// rewrite redirects
-				else if (line.StartsWith("Location: ", StringComparison.Ordinal)) {
-					var target = line.Substring(10).TrimEnd('/');
-					IProxyConfiguration proxy2 = null;
-					foreach (var s in _settings.Proxy) {
-						if (target.StartsWith(s.Target, StringComparison.OrdinalIgnoreCase) && (s.Target.Length == target.Length || target[s.Target.Length] == '/')) {
-							proxy2 = s;
-							break;
-						}
-					}
-					if (proxy2 != null) {
-						responseHeaders[i] = "Location: " + CommonUtility.CombineWithSlash((isHttps ? Uri.UriSchemeHttps : Uri.UriSchemeHttp) + "://" + originalHost, proxy2.Path, target.Substring(proxy2.Target.Length));
-					}
-				}
+				//else if (line.StartsWith("Location: ", StringComparison.Ordinal)) {
+				//	var target = line.Substring(10).TrimEnd('/');
+				//	IProxyConfiguration proxy2 = null;
+				//	foreach (var s in _settings.Proxy) {
+				//		if (target.StartsWith(s.Target, StringComparison.OrdinalIgnoreCase) && (s.Target.Length == target.Length || target[s.Target.Length] == '/')) {
+				//			proxy2 = s;
+				//			break;
+				//		}
+				//	}
+				//	if (proxy2 != null) {
+				//		responseHeaders[i] = "Location: " + CommonUtility.CombineWithSlash((isHttps ? Uri.UriSchemeHttps : Uri.UriSchemeHttp) + "://" + originalHost, proxy2.Path, target.Substring(proxy2.Target.Length));
+				//	}
+				//}
 			}
 			return true;
 		}
