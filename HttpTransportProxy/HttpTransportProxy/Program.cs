@@ -322,6 +322,11 @@ namespace HttpTransportProxy {
 							}
 
 							remoteSocket.Shutdown(SocketShutdown.Both);
+
+							//requestState.bodyLength = 0;
+							//responseState.bodyLength = 0;
+							//requestHeaders.Clear();
+							//responseHeaders.Clear();
 						}
 						if (targetSslStream != null) {
 							await targetSslStream.DisposeAsync();
@@ -488,14 +493,15 @@ namespace HttpTransportProxy {
 			bool isEnd = false;
 			if (isChunked) {
 				// write remaining data
-				if (readState.bytesBuffered - readState.bytesConsumed > 0) {
-					readState.bodyLength += (readState.bytesBuffered - readState.bytesConsumed);
-					await targetStream.WriteAsync(readState.buffer, readState.bytesConsumed, readState.bytesBuffered - readState.bytesConsumed);
+				var bytesInBuffer = readState.bytesBuffered - readState.bytesConsumed;
+				if (bytesInBuffer > 0) {
+					readState.bodyLength += bytesInBuffer;
+					await targetStream.WriteAsync(readState.buffer, readState.bytesConsumed, bytesInBuffer);
 				}
 
 				int chunkCount = 0;
 				long chunkSize = 0, chunkLength = 0;
-				bool isStart = true, getMoreData = true;
+				bool isStart = true, getMoreData;
 				readState.bytesIndex = readState.bytesConsumed;
 				do {
 					if (isStart) {
@@ -525,7 +531,7 @@ namespace HttpTransportProxy {
 					}
 					else if (isEnd) {
 						getMoreData = true;
-						var bytesInBuffer = readState.bytesBuffered - readState.bytesConsumed;
+						bytesInBuffer = readState.bytesBuffered - readState.bytesConsumed;
 						if (bytesInBuffer > 1) {
 							if (readState.buffer[readState.bytesConsumed] != (byte)'\r' || readState.buffer[readState.bytesConsumed + 1] != (byte)'\n') {
 								return (ReadDataStatus.InvalidChunkEnd, $"{readState.buffer[readState.bytesConsumed]:x2}{readState.buffer[readState.bytesConsumed + 1]:x2}");
@@ -561,7 +567,7 @@ namespace HttpTransportProxy {
 					}
 
 					if (getMoreData) {
-						var bytesInBuffer = readState.bytesBuffered - readState.bytesConsumed;
+						bytesInBuffer = readState.bytesBuffered - readState.bytesConsumed;
 						if (bytesInBuffer > (readState.buffer.Length / 2)) {
 							// expand buffer
 							var newBuffer = ArrayPool<byte>.Shared.Rent((readState.buffer.Length < (int.MaxValue / 2)) ? readState.buffer.Length * 2 : int.MaxValue);
@@ -590,15 +596,19 @@ namespace HttpTransportProxy {
 					return (ReadDataStatus.MoreDataExpected, null);
 				}
 
-				if (readState.bytesBuffered - readState.bytesConsumed > 0) {
+				bytesInBuffer = readState.bytesBuffered - readState.bytesConsumed;
+				if (bytesInBuffer > 0) {
 					return (ReadDataStatus.MoreDataReceivedThanExpected, null);
 				}
 			}
 			else {
 				// write remaining data
-				if (readState.bytesBuffered - readState.bytesConsumed > 0) {
-					readState.bodyLength += (readState.bytesBuffered - readState.bytesConsumed);
-					await targetStream.WriteAsync(readState.buffer, readState.bytesConsumed, readState.bytesBuffered - readState.bytesConsumed);
+				var bytesInBuffer = readState.bytesBuffered - readState.bytesConsumed;
+				if (bytesInBuffer > 0) {
+					readState.bodyLength += bytesInBuffer;
+					await targetStream.WriteAsync(readState.buffer, readState.bytesConsumed, bytesInBuffer);
+					readState.bytesConsumed += bytesInBuffer;
+					readState.bytesIndex = readState.bytesConsumed;
 				}
 
 				// read remaining data
