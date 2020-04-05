@@ -83,6 +83,15 @@ namespace HttpTransportProxy {
 		}
 
 		private static async Task HandleConnection(Socket socket, X509Certificate2 certificate) {
+			try {
+				await HandleConnectionInternal(socket, certificate);
+			}
+			catch (Exception ex) {
+				Console.WriteLine("Exception: " + ex.Message);
+			}
+		}
+
+		private static async Task HandleConnectionInternal(Socket socket, X509Certificate2 certificate) {
 			Console.WriteLine($"Accepted connection from {socket.RemoteEndPoint}");
 
 			byte[] buffer = ArrayPool<byte>.Shared.Rent(1024);
@@ -176,6 +185,7 @@ namespace HttpTransportProxy {
 				}
 
 				string destination = headers[0].Substring(i + 1, i2 - i - 1);
+
 				// select proxy
 				IProxyConfiguration proxy = null;
 				foreach (var s in _settings.Proxy) {
@@ -198,6 +208,7 @@ namespace HttpTransportProxy {
 				var targetUri = new Uri(proxy.Target, UriKind.Absolute);
 				bool isContinue = false, isChunked = false;
 				long contentLength = 0;
+				string originalHost = null;
 				for (i = 0; i < headers.Count; i++) {
 					var line = headers[i];
 					if (string.Equals("Expect: 100-continue", line, StringComparison.Ordinal)) {
@@ -215,12 +226,14 @@ namespace HttpTransportProxy {
 						isChunked = true;
 					}
 					else if (line.StartsWith("Host: ", StringComparison.Ordinal)) {
-						headers[i] = "Host: " + targetUri.Host;
+						originalHost = line.Substring(6);
+						headers[i] = "Host: " + targetUri.Host + (targetUri.IsDefaultPort ? string.Empty : ":" + targetUri.Port.ToString(CultureInfo.InvariantCulture));
 					}
 				}
 
 				IPAddress[] serverIps = Dns.GetHostAddresses(targetUri.DnsSafeHost);
 				if (serverIps == null || serverIps.Length == 0) {
+					ArrayPool<byte>.Shared.Return(buffer);
 					Console.WriteLine($"Failed to resolve addresses of {proxy.Target}");
 					socket.Close();
 					return;
@@ -281,6 +294,7 @@ namespace HttpTransportProxy {
 												isStart = false;
 												if (line.Length == 0 || !long.TryParse(line, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out chunkSize) || chunkSize < 0) {
 													Console.WriteLine($"Unexpected chunk size {line}");
+													ArrayPool<byte>.Shared.Return(buffer2);
 													ArrayPool<byte>.Shared.Return(buffer);
 													socket.Close();
 													return;
@@ -298,6 +312,7 @@ namespace HttpTransportProxy {
 									if (bytesInBuffer > 1) {
 										if (buffer[bytesConsumed] != (byte)'\r' || buffer[bytesConsumed + 1] != (byte)'\n') {
 											Console.WriteLine($"Unexpected chunk end {buffer[bytesConsumed]:x2} {buffer[bytesConsumed + 1]:x2}");
+											ArrayPool<byte>.Shared.Return(buffer2);
 											ArrayPool<byte>.Shared.Return(buffer);
 											socket.Close();
 											return;
@@ -333,7 +348,6 @@ namespace HttpTransportProxy {
 								}
 
 								if (getMoreData) {
-									if (!stream.DataAvailable) { break; }
 									var bytesInBuffer = bytesBuffered - bytesConsumed;
 									if (bytesInBuffer > (buffer.Length / 2)) {
 										// expand buffer
@@ -392,7 +406,7 @@ namespace HttpTransportProxy {
 							}
 
 							// read remaining data
-							while (stream.DataAvailable) {
+							while (requestLength < contentLength) {
 								var bytesRead = await stream.ReadAsync(buffer);
 								if (bytesRead == 0) {
 									break;
@@ -505,6 +519,20 @@ namespace HttpTransportProxy {
 							else if (string.Equals("Transfer-Encoding: chunked", line, StringComparison.OrdinalIgnoreCase)) {
 								isChunked = true;
 							}
+							// rewrite redirects
+							else if (line.StartsWith("Location: ", StringComparison.Ordinal)) {
+								var target = line.Substring(10);
+								IProxyConfiguration proxy2 = null;
+								foreach (var s in _settings.Proxy) {
+									if (target.StartsWith(s.Target, StringComparison.OrdinalIgnoreCase) && (s.Target.Length == target.Length || target[s.Target.Length] == '/')) {
+										proxy2 = s;
+										break;
+									}
+								}
+								if (proxy2 != null) {
+									responseHeaders[i] = "Location: " + CommonUtility.CombineWithSlash("http://" + originalHost, proxy2.Path, target.Substring(proxy2.Target.Length));
+								}
+							}
 						}
 
 						// write headers
@@ -607,7 +635,6 @@ namespace HttpTransportProxy {
 								}
 
 								if (getMoreData) {
-									if (!remoteStream.DataAvailable) { break; }
 									var bytesInBuffer = bytesBuffered - bytesConsumed;
 									if (bytesInBuffer > (buffer.Length / 2)) {
 										// expand buffer
@@ -663,7 +690,7 @@ namespace HttpTransportProxy {
 							}
 
 							// read remaining data
-							while (remoteStream.DataAvailable) {
+							while (responseLength < contentLength) {
 								var bytesRead = await remoteStream.ReadAsync(buffer);
 								if (bytesRead == 0) {
 									break;
@@ -683,6 +710,7 @@ namespace HttpTransportProxy {
 				ArrayPool<byte>.Shared.Return(buffer);
 				socket.Close();
 			}
+			Console.WriteLine("Request completed");
 		}
 
 		private static IFarmSettings GetFarSettings(IConfiguration config) {

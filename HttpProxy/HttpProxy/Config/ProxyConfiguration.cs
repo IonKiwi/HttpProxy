@@ -47,6 +47,12 @@ namespace HttpProxy.Config {
 					h.Init();
 				}
 			}
+			if (Path != null) {
+				Path = Path.TrimEnd('/');
+			}
+			if (Target != null) {
+				Target = Target.TrimEnd('/');
+			}
 			if (RemoveHeaders != null) {
 				_removeHeadersCopy = ImmutableHashSet.Create<string>(StringComparer.Ordinal, RemoveHeaders.ToArray());
 			}
