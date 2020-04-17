@@ -50,6 +50,7 @@ namespace HttpProxy.Core {
 			var handler = new SocketsHttpHandler() {
 				AllowAutoRedirect = false,
 				UseProxy = true,
+				UseCookies = false,
 				AutomaticDecompression = DecompressionMethods.None,
 			};
 			handler.SslOptions.ApplicationProtocols = new List<SslApplicationProtocol>() { SslApplicationProtocol.Http11, SslApplicationProtocol.Http2 };
@@ -64,6 +65,7 @@ namespace HttpProxy.Core {
 			//var handler = new HttpClientHandler() {
 			//	AllowAutoRedirect = false,
 			//	UseProxy = true,
+			//	UseCookies = false,
 			//	AutomaticDecompression = DecompressionMethods.None,
 			//	SslProtocols = System.Security.Authentication.SslProtocols.Tls12,
 			//	ServerCertificateCustomValidationCallback = (sender, certificate, chain, sslPolicyErrors) => ValidateServerCertificate(certificate, chain, sslPolicyErrors, proxy)
