@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using HttpProxy.Config;
 using HttpProxy.Core;
@@ -28,11 +29,14 @@ namespace HttpProxy {
 		// This method gets called by the runtime. Use this method to add services to the container.
 		// For more information on how to configure your application, visit https://go.microsoft.com/fwlink/?LinkID=398940
 		public void ConfigureServices(IServiceCollection services) {
+
+			ThreadPool.SetMinThreads(200, 200);
+
 			var appSettings = new FarmSettingsValues();
 			Configuration.GetSection("FarmSettings").Bind(appSettings);
 
 			string json;
-			using (var file = File.Open(appSettings.ConfigPath + "\\HttpProxy.global.js", FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
+			using (var file = File.Open(appSettings.ConfigPath + Path.DirectorySeparatorChar + "HttpProxy.global.js", FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
 				using (var sr = new StreamReader(file, Encoding.UTF8, false)) {
 					json = sr.ReadToEnd();
 				}

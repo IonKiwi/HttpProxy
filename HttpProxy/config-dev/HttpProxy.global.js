@@ -1,7 +1,13 @@
 {
     "ServerBindings": [{
-            "port": 80,
+            "port": 59638,
             "config": null
+        }, {
+            "port": 59639,
+            "config": {
+                "ServerCertificateProvider": "WindowsStore",
+                "ServerCertificate": "CN=dev-w10 TLS"
+            }
         }
     ],
     "Proxy": [{
