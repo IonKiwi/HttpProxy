@@ -5,12 +5,8 @@ using System.Threading.Tasks;
 
 namespace HttpProxy.Config {
 	public interface IFarmSettings {
-		public IReadOnlyList<IServerBinding> ServerBindings {
-			get;
-		}
+		IReadOnlyList<IServerBinding> ServerBindings { get; }
 
-		public IReadOnlyList<IProxyConfiguration> Proxy {
-			get;
-		}
+		IReadOnlyList<IProxyConfiguration> Proxy { get; }
 	}
 }

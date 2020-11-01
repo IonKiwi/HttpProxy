@@ -5,8 +5,8 @@
         }, {
             "port": 59639,
             "config": {
-                "ServerCertificateProvider": "WindowsStore",
-                "ServerCertificate": "CN=dev-w10 TLS"
+                "serverCertificateProvider": "WindowsStore",
+                "serverCertificate": "CN=dev-w10 TLS"
             }
         }
     ],
