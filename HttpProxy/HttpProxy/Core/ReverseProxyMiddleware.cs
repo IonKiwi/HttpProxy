@@ -9,6 +9,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Security;
+using System.Net.WebSockets;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -270,6 +271,11 @@ namespace HttpProxy.Core {
 
 			path = CommonUtility.CombineWithSlash(proxy.Target, path.Substring(proxy.Path.Length));
 
+			if (context.WebSockets.IsWebSocketRequest) {
+				await HandleWebSocket(id, proxy, path, context);
+				return;
+			}
+
 			HttpRequestMessage request = new HttpRequestMessage(GetHttpMethod(context.Request.Method, out var hasBody), path);
 			//request.Version = HttpVersion.Version11;
 
@@ -368,6 +374,110 @@ namespace HttpProxy.Core {
 			finally {
 				if (proxy.NewHttpClient) {
 					client.Dispose();
+				}
+			}
+		}
+
+		private async Task HandleWebSocket(string id, IProxyConfiguration proxy, string path, HttpContext context) {
+			using (var localSocket = await context.WebSockets.AcceptWebSocketAsync()) {
+				_logger.LogInformation($"{id} accepted websocket connection {proxy.Path}");
+
+				using (var remoteSocket = new ClientWebSocket()) {
+					foreach (var kv in context.Request.Headers) {
+						if (proxy.RemoveHeaders != null) {
+							if (proxy.RemoveHeaders.Contains(kv.Key)) {
+								continue;
+							}
+						}
+						// strip 'Transfer-Encoding: chunked' the whole request is send, we are not a transport level proxy
+						if (string.Equals("Transfer-Encoding", kv.Key, StringComparison.Ordinal) ||
+										string.Equals("Expect", kv.Key, StringComparison.Ordinal) ||
+										string.Equals("Host", kv.Key, StringComparison.Ordinal) ||
+										string.Equals("Connection", kv.Key, StringComparison.Ordinal) ||
+										string.Equals("Upgrade", kv.Key, StringComparison.Ordinal) ||
+										kv.Key.StartsWith("Sec-WebSocket-", StringComparison.Ordinal)) {
+							_logger.LogDebug($"Stripping request {kv.Key}: {kv.Value}");
+							continue;
+						}
+
+						remoteSocket.Options.SetRequestHeader(kv.Key, kv.Value);
+					}
+
+					if (path.StartsWith("https://", StringComparison.Ordinal)) {
+						await remoteSocket.ConnectAsync(new Uri("wss" + path.Substring(5), UriKind.Absolute), CancellationToken.None);
+					}
+					else if (path.StartsWith("http://", StringComparison.Ordinal)) {
+						await remoteSocket.ConnectAsync(new Uri("ws" + path.Substring(4), UriKind.Absolute), CancellationToken.None);
+					}
+					else {
+						throw new NotSupportedException(proxy.Target);
+					}
+
+					_logger.LogInformation($"{id} connected to remote websocket {path}");
+
+					var buffer1 = new byte[1024];
+					var buffer2 = new byte[1024];
+
+					var task1 = localSocket.ReceiveAsync(buffer1, context.RequestAborted);
+					var task2 = remoteSocket.ReceiveAsync(buffer2, context.RequestAborted);
+
+					while (true) {
+						var completed = await Task.WhenAny(task1, task2);
+						if (completed.Status != TaskStatus.RanToCompletion) {
+							_logger.LogInformation(completed.Exception, $"{id} websocket did not complete {path}");
+							return;
+						}
+
+						WebSocket socket1;
+						WebSocket socket2;
+						byte[] buffer;
+
+						if (completed == task1) {
+							socket1 = localSocket;
+							socket2 = remoteSocket;
+							buffer = buffer1;
+						}
+						else if (completed == task2) {
+							socket1 = remoteSocket;
+							socket2 = localSocket;
+							buffer = buffer2;
+						}
+						else {
+							throw new InvalidOperationException("WhenAny unknown task");
+						}
+
+						var close = false;
+						var message = completed.Result;
+						while (true) {
+							if (message.MessageType == WebSocketMessageType.Close) {
+								close = true;
+							}
+
+							await socket2.SendAsync(new ArraySegment<byte>(buffer, 0, message.Count),
+									message.MessageType,
+									message.EndOfMessage,
+									context.RequestAborted);
+
+							if (message.EndOfMessage) {
+								break;
+							}
+
+							message = await socket1.ReceiveAsync(buffer, context.RequestAborted);
+						}
+
+						if (close) {
+							await socket2.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, message.CloseStatusDescription, context.RequestAborted);
+							return;
+						}
+
+						var newTask = socket1.ReceiveAsync(buffer, context.RequestAborted);
+						if (completed == task1) {
+							task1 = newTask;
+						}
+						else if (completed == task2) {
+							task1 = newTask;
+						}
+					}
 				}
 			}
 		}

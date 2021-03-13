@@ -58,6 +58,7 @@ namespace HttpProxy {
 				app.UseDeveloperExceptionPage();
 			}
 
+			app.UseWebSockets();
 			app.UseMiddleware<ReverseProxyMiddleware>();
 
 			app.Run(async (context) => {
