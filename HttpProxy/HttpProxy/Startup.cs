@@ -36,7 +36,7 @@ namespace HttpProxy {
 			Configuration.GetSection("FarmSettings").Bind(appSettings);
 
 			string json;
-			using (var file = File.Open(appSettings.ConfigPath + Path.DirectorySeparatorChar + "HttpProxy.global.js", FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
+			using (var file = File.Open(appSettings.ConfigPath + Path.DirectorySeparatorChar + "HttpProxy.global.json", FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
 				using (var sr = new StreamReader(file, Encoding.UTF8, false)) {
 					json = sr.ReadToEnd();
 				}
