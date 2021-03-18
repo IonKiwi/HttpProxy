@@ -61,7 +61,19 @@ namespace HttpProxy.Core {
 			else {
 				handler.SslOptions.EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13;
 			}
-			handler.SslOptions.RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => ValidateServerCertificate(certificate, chain, sslPolicyErrors, proxy);
+			if (proxy.DisableTlsValidation) {
+				handler.SslOptions.RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true;
+			}
+			else {
+				handler.SslOptions.RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => ValidateServerCertificate(certificate, chain, sslPolicyErrors, proxy);
+			}
+			handler.UseProxy = proxy.UseProxy;
+			if (!string.IsNullOrEmpty(proxy.ProxyUrl)) {
+				if (!Uri.TryCreate(proxy.ProxyUrl, UriKind.Absolute, out var proxyUri)) {
+					throw new InvalidOperationException($"Invalid proxy url '{proxy.ProxyUrl}'.");
+				}
+				handler.Proxy = new CustomProxy(proxyUri);
+			}
 
 			//var handler = new HttpClientHandler() {
 			//	AllowAutoRedirect = false,
@@ -73,6 +85,24 @@ namespace HttpProxy.Core {
 			//};
 
 			return handler;
+		}
+
+		private sealed class CustomProxy : IWebProxy {
+			private readonly Uri _proxyUri;
+
+			public CustomProxy(Uri proxyUri) {
+				_proxyUri = proxyUri;
+			}
+
+			public ICredentials Credentials { get; set; }
+
+			public Uri GetProxy(Uri destination) {
+				return _proxyUri;
+			}
+
+			public bool IsBypassed(Uri host) {
+				return false;
+			}
 		}
 
 		private readonly RequestDelegate _nextMiddleware;

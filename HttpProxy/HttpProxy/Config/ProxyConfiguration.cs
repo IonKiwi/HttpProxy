@@ -18,6 +18,12 @@ namespace HttpProxy.Config {
 		IReadOnlyList<ICustomHttpHeader> Headers { get; }
 
 		IImmutableSet<string> RemoveHeaders { get; }
+
+		bool DisableTlsValidation { get; }
+
+		bool UseProxy { get; }
+
+		string ProxyUrl { get; }
 	}
 
 	public class ProxyConfiguration : IProxyConfiguration {
@@ -40,6 +46,15 @@ namespace HttpProxy.Config {
 
 		[JsonPropertyName("removeHeaders")]
 		public List<string> RemoveHeaders { get; set; }
+
+		[JsonPropertyName("disableTlsValidation")]
+		public bool DisableTlsValidation { get; set; }
+
+		[JsonPropertyName("useProxy")]
+		public bool UseProxy { get; set; } = true;
+
+		[JsonPropertyName("proxyUrl")]
+		public string ProxyUrl { get; set; }
 
 		public void Init() {
 			if (Headers != null) {
