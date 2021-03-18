@@ -68,7 +68,7 @@ namespace HttpProxy.Core {
 				handler.SslOptions.RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => ValidateServerCertificate(certificate, chain, sslPolicyErrors, proxy);
 			}
 			handler.UseProxy = proxy.UseProxy;
-			if (!string.IsNullOrEmpty(proxy.ProxyUrl)) {
+			if (proxy.UseProxy && !string.IsNullOrEmpty(proxy.ProxyUrl)) {
 				if (!Uri.TryCreate(proxy.ProxyUrl, UriKind.Absolute, out var proxyUri)) {
 					throw new InvalidOperationException($"Invalid proxy url '{proxy.ProxyUrl}'.");
 				}
@@ -439,7 +439,13 @@ namespace HttpProxy.Core {
 					else {
 						remoteSocket.Options.RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => ValidateServerCertificate(certificate, chain, sslPolicyErrors, proxy);
 					}
-					if (!string.IsNullOrEmpty(proxy.ProxyUrl)) {
+					if (!proxy.UseProxy) {
+						remoteSocket.Options.Proxy = new NoProxy();
+					}
+					//else {
+					//	remoteSocket.Options.Proxy = HttpClient.DefaultProxy;
+					//}
+					if (proxy.UseProxy && !string.IsNullOrEmpty(proxy.ProxyUrl)) {
 						if (!Uri.TryCreate(proxy.ProxyUrl, UriKind.Absolute, out var proxyUri)) {
 							throw new InvalidOperationException($"Invalid proxy url '{proxy.ProxyUrl}'.");
 						}
@@ -522,6 +528,18 @@ namespace HttpProxy.Core {
 						}
 					}
 				}
+			}
+		}
+
+		private sealed class NoProxy : IWebProxy {
+			public ICredentials Credentials { get; set; }
+
+			public Uri GetProxy(Uri destination) {
+				return null;
+			}
+
+			public bool IsBypassed(Uri host) {
+				return true;
 			}
 		}
 	}
