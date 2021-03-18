@@ -433,6 +433,19 @@ namespace HttpProxy.Core {
 						remoteSocket.Options.SetRequestHeader(kv.Key, kv.Value);
 					}
 
+					if (proxy.DisableTlsValidation) {
+						remoteSocket.Options.RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => true;
+					}
+					else {
+						remoteSocket.Options.RemoteCertificateValidationCallback = (sender, certificate, chain, sslPolicyErrors) => ValidateServerCertificate(certificate, chain, sslPolicyErrors, proxy);
+					}
+					if (!string.IsNullOrEmpty(proxy.ProxyUrl)) {
+						if (!Uri.TryCreate(proxy.ProxyUrl, UriKind.Absolute, out var proxyUri)) {
+							throw new InvalidOperationException($"Invalid proxy url '{proxy.ProxyUrl}'.");
+						}
+						remoteSocket.Options.Proxy = new CustomProxy(proxyUri);
+					}
+
 					if (path.StartsWith("https://", StringComparison.Ordinal)) {
 						await remoteSocket.ConnectAsync(new Uri("wss" + path.Substring(5), UriKind.Absolute), CancellationToken.None);
 					}
