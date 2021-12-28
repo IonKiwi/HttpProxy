@@ -62,7 +62,7 @@ namespace HttpProxy {
 			app.UseMiddleware<ReverseProxyMiddleware>();
 
 			app.Run(async (context) => {
-				await context.Response.WriteAsync("Hello World!");
+				await context.Response.WriteAsync("HttpProxy v1.0");
 			});
 		}
 	}
